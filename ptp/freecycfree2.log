@@ -1,0 +1,33 @@
+ptp4l[1993449.195]: selected /dev/ptp3 as PTP clock
+ptp4l[1993449.197]: driver rejected most general HWTSTAMP filter
+ptp4l[1993449.197]: port 1: INITIALIZING to LISTENING on INIT_COMPLETE
+ptp4l[1993449.197]: port 0: INITIALIZING to LISTENING on INIT_COMPLETE
+ptp4l[1993451.108]: port 1: new foreign master 20c9d0.fffe.32c61b-1
+ptp4l[1993455.388]: selected best master clock 20c9d0.fffe.32c61b
+ptp4l[1993455.389]: port 1: LISTENING to UNCALIBRATED on RS_SLAVE
+ptp4l[1993458.317]: clock update master offset 112486287448719 s0 freq      -0 path delay         1
+ptp4l[1993458.767]: clock update master offset 112486287447719 s0 freq      -0 path delay         1
+ptp4l[1993459.218]: clock update master offset 112486287450719 s0 freq      -0 path delay         1
+ptp4l[1993459.894]: clock update master offset 112486287450719 s1 freq   +1649 path delay         1
+ptp4l[1993460.344]: clock update master offset       1340 s2 freq   +6248 path delay         1
+ptp4l[1993460.344]: port 1: UNCALIBRATED to SLAVE on MASTER_CLOCK_SELECTED
+ptp4l[1993461.020]: clock update master offset       2610 s2 freq   +7435 path delay         1
+ptp4l[1993461.471]: clock update master offset         15 s2 freq   +5876 path delay         1
+ptp4l[1993462.147]: clock update master offset      -4352 s2 freq   -2929 path delay         1
+ptp4l[1993462.597]: clock update master offset      -6774 s2 freq  -13363 path delay         1
+ptp4l[1993463.048]: clock update master offset      -8719 s2 freq  -23208 path delay         1
+ptp4l[1993463.724]: clock update master offset      -3269 s2 freq  -17476 path delay         1
+ptp4l[1993464.174]: clock update master offset      12168 s2 freq  +13601 path delay         1
+ptp4l[1993464.850]: clock update master offset      27712 s2 freq  +55174 path delay         1
+ptp4l[1993465.301]: clock update master offset      27901 s2 freq  +47559 path delay         1
+ptp4l[1993465.976]: clock update master offset       6736 s2 freq  +38309 path delay         1
+ptp4l[1993466.427]: clock update master offset     -24385 s2 freq  -19812 path delay         1
+ptp4l[1993467.103]: clock update master offset     -50039 s2 freq  -74784 path delay         1
+ptp4l[1993467.553]: clock update master offset     -49163 s2 freq  -84603 path delay         1
+ptp4l[1993468.004]: clock update master offset     -19551 s2 freq  -66259 path delay         1
+ptp4l[1993469.130]: clock update master offset      18873 s2 freq   -1112 path delay         1
+ptp4l[1993469.806]: clock update master offset     102112 s2 freq +179681 path delay         1
+ptp4l[1993470.257]: clock update master offset     141951 s2 freq +225559 path delay         1
+ptp4l[1993470.933]: clock update master offset      77782 s2 freq +183178 path delay         1
+ptp4l[1993471.383]: clock update master offset     -67527 s2 freq  -11485 path delay         1
+ptp4l[1993472.059]: clock update master offset    -181561 s2 freq -262744 path delay         1
