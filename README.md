@@ -78,9 +78,12 @@ Use this bibtex to cite the paper:
 
 ```plain
 @inproceedings {273763,
+author = {Paizhuo Chen and Zhice Yang},
 title = {Understanding Precision Time Protocol in Today{\textquoteright}s Wi-Fi Networks: A Measurement Study},
 booktitle = {2021 {USENIX} Annual Technical Conference ({USENIX} {ATC} 21)},
 year = {2021},
+isbn = {978-1-939133-23-6},
+pages = {597--610},
 url = {https://www.usenix.org/conference/atc21/presentation/chen},
 publisher = {{USENIX} Association},
 month = jul,
@@ -89,5 +92,5 @@ month = jul,
 
 ## Contact
 
-If you have any questions, please don't hesitate to contact [chenpzh@shanghaitech.edu.cn](mailto:chenpzh@shanghaitech.edu.cn).
+If you have any questions, please don't hesitate to contact [yangzhc@shanghaitech.edu.cn](mailto:yangzhc@shanghaitech.edu.cn) or [chenpzh@shanghaitech.edu.cn](mailto:chenpzh@shanghaitech.edu.cn).
 
