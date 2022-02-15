@@ -1,0 +1,974 @@
+diff --git a/ath9k/Makefile b/ath9k/Makefile
+index f71b2ad..0c8a7f1 100644
+--- a/ath9k/Makefile
++++ b/ath9k/Makefile
+@@ -10,7 +10,7 @@ ath9k-y +=	beacon.o \
+ 		channel.o
+ 
+ ath9k-$(CONFIG_ATH9K_BTCOEX_SUPPORT) += mci.o
+-ath9k-$(CONFIG_ATH9K_PCI) += pci.o
++ath9k-$(CONFIG_ATH9K_PCI) += pci.o ptp.o
+ ath9k-$(CONFIG_ATH9K_AHB) += ahb.o
+ ath9k-$(CONFIG_ATH9K_DFS_DEBUGFS) += dfs_debug.o
+ ath9k-$(CONFIG_ATH9K_DFS_CERTIFIED) += dfs.o
+diff --git a/ath9k/ar9003_2p2_initvals.h b/ath9k/ar9003_2p2_initvals.h
+index c07866a..6b3c048 100644
+--- a/ath9k/ar9003_2p2_initvals.h
++++ b/ath9k/ar9003_2p2_initvals.h
+@@ -304,7 +304,7 @@ static const u32 ar9300_2p2_mac_postamble[][5] = {
+ 	{0x00008014, 0x03e803e8, 0x07d007d0, 0x10801600, 0x08400b00},
+ 	{0x0000801c, 0x128d8027, 0x128d804f, 0x12e00057, 0x12e0002b},
+ 	{0x00008120, 0x18f04800, 0x18f04800, 0x18f04810, 0x18f04810},
+-	{0x000081d0, 0x00003210, 0x00003210, 0x0000320a, 0x0000320a},
++	{0x000081d0, 0x00003010, 0x00003010, 0x0000300a, 0x0000300a},
+ 	{0x00008318, 0x00003e80, 0x00007d00, 0x00006880, 0x00003440},
+ };
+ 
+@@ -1310,7 +1310,7 @@ static const u32 ar9300_2p2_mac_core[][2] = {
+ 	{0x0000105c, 0x002ffc0f},
+ 	{0x00001060, 0x002ffc0f},
+ 	{0x00001064, 0x002ffc0f},
+-	{0x000010f0, 0x00000100},
++	{0x000010f0, 0x0a000100},
+ 	{0x00001270, 0x00000000},
+ 	{0x000012b0, 0x00000000},
+ 	{0x000012f0, 0x00000000},
+diff --git a/ath9k/ath9k.h b/ath9k/ath9k.h
+index 0fca44e..8f41cec 100644
+--- a/ath9k/ath9k.h
++++ b/ath9k/ath9k.h
+@@ -23,7 +23,12 @@
+ #include <linux/leds.h>
+ #include <linux/completion.h>
+ #include <linux/time.h>
++#include <linux/ktime.h>
++#include <linux/timecounter.h>
+ #include <linux/hw_random.h>
++#include <linux/ptp_clock_kernel.h>
++#include <linux/ptp_classify.h>
++#include <linux/hrtimer.h>
+ 
+ #include "common.h"
+ #include "debug.h"
+@@ -107,7 +112,7 @@ int ath_descdma_setup(struct ath_softc *sc, struct ath_descdma *dd,
+ /* minimum h/w qdepth to be sustained to maximize aggregation */
+ #define ATH_AGGR_MIN_QDEPTH        2
+ /* minimum h/w qdepth for non-aggregated traffic */
+-#define ATH_NON_AGGR_MIN_QDEPTH    8
++#define ATH_NON_AGGR_MIN_QDEPTH    32
+ #define ATH_HW_CHECK_POLL_INT      1000
+ #define ATH_TXFIFO_DEPTH           8
+ #define ATH_TX_ERROR               0x01
+@@ -583,7 +588,7 @@ bool ath_stoprecv(struct ath_softc *sc);
+ u32 ath_calcrxfilter(struct ath_softc *sc);
+ int ath_rx_init(struct ath_softc *sc, int nbufs);
+ void ath_rx_cleanup(struct ath_softc *sc);
+-int ath_rx_tasklet(struct ath_softc *sc, int flush, bool hp);
++int ath_rx_tasklet(struct ath_softc *sc, int flush, bool hp, ktime_t *tstamp);
+ struct ath_txq *ath_txq_setup(struct ath_softc *sc, int qtype, int subtype);
+ void ath_txq_unlock_complete(struct ath_softc *sc, struct ath_txq *txq);
+ void ath_tx_cleanupq(struct ath_softc *sc, struct ath_txq *txq);
+@@ -605,7 +610,7 @@ int ath_tx_start(struct ieee80211_hw *hw, struct sk_buff *skb,
+ void ath_tx_cabq(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		 struct sk_buff *skb);
+ void ath_tx_tasklet(struct ath_softc *sc);
+-void ath_tx_edma_tasklet(struct ath_softc *sc);
++void ath_tx_edma_tasklet(struct ath_softc *sc, ktime_t *tstamp);
+ int ath_tx_aggr_start(struct ath_softc *sc, struct ieee80211_sta *sta,
+ 		      u16 tid, u16 *ssn);
+ void ath_tx_aggr_stop(struct ath_softc *sc, struct ieee80211_sta *sta, u16 tid);
+@@ -1028,12 +1033,27 @@ struct ath_softc {
+ 
+ 	u8 gtt_cnt;
+ 	u32 intrstatus;
++    ktime_t intrtstamp;
+ 	u16 ps_flags; /* PS_* */
+ 	bool ps_enabled;
+ 	bool ps_idle;
+ 	short nbcnvifs;
+ 	unsigned long ps_usecount;
+ 
++    spinlock_t systim_lock;
++    struct cyclecounter cc;
++    struct timecounter tc;
++    struct ptp_clock *ptp_clock;
++    struct ptp_clock_info ptp_clock_info;
++    u32    cc_mult;
++    struct hrtimer off_timer;
++    ktime_t off_interval;
++    u32    off_counter;
++    s64    off_last;
++    u64    off_base_time;
++
++    u64 ptp_dirtyts;
++
+ 	u16 airtime_flags; /* AIRTIME_* */
+ 
+ 	struct ath_rx rx;
+@@ -1164,4 +1184,9 @@ static inline int ath_ahb_init(void) { return 0; };
+ static inline void ath_ahb_exit(void) {};
+ #endif
+ 
++void ath9k_ptp_init(struct ath_softc *sc);
++void ath9k_ptp_remove(struct ath_softc *sc);
++void ath9k_cyc2hwtstamp(struct ath_softc *sc, struct skb_shared_hwtstamps *hwtstamps, u32 cycle);
++#define ATH9K_PTP_FAKE_SHIFT 21
++
+ #endif /* ATH9K_H */
+diff --git a/ath9k/beacon.c b/ath9k/beacon.c
+index e36f947..4266118 100644
+--- a/ath9k/beacon.c
++++ b/ath9k/beacon.c
+@@ -314,8 +314,8 @@ static int ath9k_beacon_choose_slot(struct ath_softc *sc)
+ 
+ 	if (sc->sc_ah->opmode != NL80211_IFTYPE_AP &&
+ 	    sc->sc_ah->opmode != NL80211_IFTYPE_MESH_POINT) {
+-		ath_dbg(common, BEACON, "slot 0, tsf: %llu\n",
+-			ath9k_hw_gettsf64(sc->sc_ah));
++//		ath_dbg(common, BEACON, "slot 0, tsf: %llu\n",
++//			ath9k_hw_gettsf64(sc->sc_ah));
+ 		return 0;
+ 	}
+ 
+diff --git a/ath9k/debug.c b/ath9k/debug.c
+index 0a6eb8a..76c6840 100644
+--- a/ath9k/debug.c
++++ b/ath9k/debug.c
+@@ -126,6 +126,91 @@ static const struct file_operations fops_debug = {
+ 
+ #endif
+ 
++static ssize_t read_file_dirtyts(struct file *file, char __user *user_buf, size_t count, loff_t *ppos) {
++    struct ath_softc *sc = file->private_data;
++    u8 buf[sizeof(u64)];
++
++    memcpy(buf, &sc->ptp_dirtyts, sizeof buf);
++    return simple_read_from_buffer(user_buf, count, ppos, buf, sizeof buf);
++}
++
++static ssize_t write_file_dirtyts(struct file *file, const char __user *user_buf,
++                size_t count, loff_t *ppos) {
++    struct ath_softc *sc = file->private_data;
++    u8 buf[sizeof(u64)];
++    ssize_t len;
++    u64 dirty_cycle;
++    u32 raw_tsf;
++    s64 delta;
++    s64 dirty_ns;
++    unsigned long flags;
++    u32 remain;
++
++    len = simple_write_to_buffer(buf, sizeof buf, ppos, user_buf, count);
++    if (len < 0) {
++        return len;
++    }
++    if (len < sizeof buf) {
++        return -EINVAL;
++    }
++
++    memcpy(&dirty_cycle, buf, sizeof buf);
++    raw_tsf = (dirty_cycle >> 32);
++    remain = dirty_cycle & 0xffffffffU;
++
++    spin_lock_irqsave(&sc->systim_lock, flags);
++    dirty_ns = timecounter_cyc2time(&sc->tc, raw_tsf);
++    delta = 0;
++    if (remain) {
++        u64 frac = 0;
++        delta = cyclecounter_cyc2ns(&sc->cc, 1, sc->cc.mask, &frac);
++        delta = delta * remain / 1000;
++    }
++    spin_unlock_irqrestore(&sc->systim_lock, flags);
++
++    dirty_ns += delta;
++    sc->ptp_dirtyts = dirty_ns;
++
++    return len;
++}
++
++static const struct file_operations fops_dirtyts = {
++	.read = read_file_dirtyts,
++	.write = write_file_dirtyts,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++static ssize_t read_file_trigger_cbr(struct file *file, char __user *user_buf, size_t count, loff_t *ppos) {
++    return -EINVAL;
++}
++
++static ssize_t write_file_trigger_cbr(struct file *file, const char __user *user_buf,
++                size_t count, loff_t *ppos) {
++    struct ath_softc *sc = file->private_data;
++    struct ath_hw *ah = sc->sc_ah;
++
++    if (count & 1) {
++        printk("ath9k: cbr open\n");
++//        REG_RMW(ah, AR_QMISC(ATH_TXQ_AC_VI), AR_Q_MISC_FSP_CBR, AR_Q_MISC_FSP);
++        REG_WRITE(ah, AR_QCBRCFG(ATH_TXQ_AC_VI), 0xc350);
++    } else {
++        printk("ath9k: cbr gated\n");
++//        REG_RMW(ah, AR_QMISC(ATH_TXQ_AC_VI), 0x4, AR_Q_MISC_FSP);
++    }
++
++    return count;
++}
++
++static const struct file_operations fops_trigger_cbr = {
++	.read = read_file_trigger_cbr,
++	.write = write_file_trigger_cbr,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
+ #define DMA_BUF_LEN 1024
+ 
+ 
+@@ -1430,6 +1515,12 @@ int ath9k_init_debug(struct ath_hw *ah)
+ 				    sc->debug.debugfs_phy,
+ 				    read_file_dump_nfcal);
+ 
++    debugfs_create_file("dirtyts", 0600, sc->debug.debugfs_phy,
++                sc, &fops_dirtyts);
++
++    debugfs_create_file("trigger_cbr", 0600, sc->debug.debugfs_phy,
++                sc, &fops_trigger_cbr);
++
+ 	ath9k_cmn_debug_base_eeprom(sc->debug.debugfs_phy, sc->sc_ah);
+ 	ath9k_cmn_debug_modal_eeprom(sc->debug.debugfs_phy, sc->sc_ah);
+ 
+diff --git a/ath9k/hw.c b/ath9k/hw.c
+index bb319f2..e343b57 100644
+--- a/ath9k/hw.c
++++ b/ath9k/hw.c
+@@ -3022,8 +3022,8 @@ EXPORT_SYMBOL(ath9k_hw_gettsf64);
+ 
+ void ath9k_hw_settsf64(struct ath_hw *ah, u64 tsf64)
+ {
+-	REG_WRITE(ah, AR_TSF_L32, tsf64 & 0xffffffff);
+-	REG_WRITE(ah, AR_TSF_U32, (tsf64 >> 32) & 0xffffffff);
++//	REG_WRITE(ah, AR_TSF_L32, tsf64 & 0xffffffff);
++//	REG_WRITE(ah, AR_TSF_U32, (tsf64 >> 32) & 0xffffffff);
+ }
+ EXPORT_SYMBOL(ath9k_hw_settsf64);
+ 
+@@ -3043,6 +3043,7 @@ void ath9k_hw_set_tsfadjust(struct ath_hw *ah, bool set)
+ 	if (set)
+ 		ah->misc_mode |= AR_PCU_TX_ADD_TSF;
+ 	else
++    //    ;
+ 		ah->misc_mode &= ~AR_PCU_TX_ADD_TSF;
+ }
+ EXPORT_SYMBOL(ath9k_hw_set_tsfadjust);
+diff --git a/ath9k/hw.h b/ath9k/hw.h
+index 68956cd..9663c50 100644
+--- a/ath9k/hw.h
++++ b/ath9k/hw.h
+@@ -235,7 +235,7 @@
+ enum ath_hw_txq_subtype {
+ 	ATH_TXQ_AC_BK = 0,
+ 	ATH_TXQ_AC_BE = 1,
+-	ATH_TXQ_AC_VI = 2,
++	ATH_TXQ_AC_VI = 5,
+ 	ATH_TXQ_AC_VO = 3,
+ };
+ 
+diff --git a/ath9k/init.c b/ath9k/init.c
+index c070a9e..85b46ae 100644
+--- a/ath9k/init.c
++++ b/ath9k/init.c
+@@ -197,8 +197,16 @@ static unsigned int ath9k_ioread32(void *hw_priv, u32 reg_offset)
+ 		spin_lock_irqsave(&sc->sc_serial_rw, flags);
+ 		val = ioread32(sc->mem + reg_offset);
+ 		spin_unlock_irqrestore(&sc->sc_serial_rw, flags);
+-	} else
++	} else {
++        /*
++        if (reg_offset == AR_TSF_L32) {
++            printk("ath9k: ioread32 unlock L32");
++        } else if (reg_offset == AR_TSF_U32) {
++            printk("ath9k: ioread32 unlock U32");
++        }
++        */
+ 		val = ioread32(sc->mem + reg_offset);
++    }
+ 	return val;
+ }
+ 
+diff --git a/ath9k/mac.c b/ath9k/mac.c
+index 58d02c1..64213a7 100644
+--- a/ath9k/mac.c
++++ b/ath9k/mac.c
+@@ -369,6 +369,7 @@ bool ath9k_hw_resettxqueue(struct ath_hw *ah, u32 q)
+ 	struct ath_common *common = ath9k_hw_common(ah);
+ 	struct ath9k_tx_queue_info *qi;
+ 	u32 cwMin, chanCwMin, value;
++    int hcfenabled = 0;
+ 
+ 	qi = &ah->txq[q];
+ 	if (qi->tqi_type == ATH9K_TX_QUEUE_INACTIVE) {
+@@ -378,6 +379,14 @@ bool ath9k_hw_resettxqueue(struct ath_hw *ah, u32 q)
+ 
+ 	ath_dbg(common, QUEUE, "Reset TX queue: %u\n", q);
+ 
++    if (q == ATH_TXQ_AC_VI) {
++        qi->tqi_cwmin = qi->tqi_cwmax = 0;
++        qi->tqi_aifs = 0;
++        qi->tqi_cbrPeriod = 5000;
++        qi->tqi_cbrOverflowLimit = 0;
++//        hcfenabled = 1;
++    }
++
+ 	if (qi->tqi_cwmin == ATH9K_TXQ_USEDEFAULT) {
+ 		chanCwMin = INIT_CWMIN;
+ 
+@@ -413,8 +422,10 @@ bool ath9k_hw_resettxqueue(struct ath_hw *ah, u32 q)
+ 		REG_SET_BIT(ah, AR_QMISC(q), AR_Q_MISC_FSP_CBR |
+ 			    (qi->tqi_cbrOverflowLimit ?
+ 			     AR_Q_MISC_CBR_EXP_CNTR_LIMIT_EN : 0));
++//        REG_SET_BIT(ah, AR_QMISC(q), AR_Q_MISC_ONE_SHOT_EN);
+ 	}
+ 	if (qi->tqi_readyTime && (qi->tqi_type != ATH9K_TX_QUEUE_CAB)) {
++        printk("ath9k: tqi set rdytime: %d\n", q);
+ 		REG_WRITE(ah, AR_QRDYTIMECFG(q),
+ 			  SM(qi->tqi_readyTime, AR_Q_RDYTIMECFG_DURATION) |
+ 			  AR_Q_RDYTIMECFG_EN);
+@@ -494,6 +505,9 @@ bool ath9k_hw_resettxqueue(struct ath_hw *ah, u32 q)
+ 		break;
+ 	}
+ 
++    if (hcfenabled) {
++        REG_SET_BIT(ah, AR_QMISC(q), 0x00000016);
++    }
+ 	if (qi->tqi_intFlags & ATH9K_TXQ_USE_LOCKOUT_BKOFF_DIS) {
+ 		REG_SET_BIT(ah, AR_DMISC(q),
+ 			    SM(AR_D_MISC_ARB_LOCKOUT_CNTRL_GLOBAL,
+diff --git a/ath9k/main.c b/ath9k/main.c
+index 1049773..0b3aa74 100644
+--- a/ath9k/main.c
++++ b/ath9k/main.c
+@@ -16,6 +16,7 @@
+ 
+ #include <linux/nl80211.h>
+ #include <linux/delay.h>
++#include <linux/ktime.h>
+ #include "ath9k.h"
+ #include "btcoex.h"
+ 
+@@ -377,10 +378,12 @@ void ath9k_tasklet(unsigned long data)
+ 	unsigned long flags;
+ 	u32 status;
+ 	u32 rxmask;
++    ktime_t tstamp;
+ 
+ 	spin_lock_irqsave(&sc->intr_lock, flags);
+ 	status = sc->intrstatus;
+ 	sc->intrstatus = 0;
++    tstamp = sc->intrtstamp;
+ 	spin_unlock_irqrestore(&sc->intr_lock, flags);
+ 
+ 	ath9k_ps_wakeup(sc);
+@@ -429,7 +432,7 @@ void ath9k_tasklet(unsigned long data)
+ 		 * the next Beacon.
+ 		 */
+ 		ath_dbg(common, PS, "TSFOOR - Sync with next Beacon\n");
+-		sc->ps_flags |= PS_WAIT_FOR_BEACON | PS_BEACON_SYNC;
++		// sc->ps_flags |= PS_WAIT_FOR_BEACON | PS_BEACON_SYNC;
+ 	}
+ 	spin_unlock_irqrestore(&sc->sc_pm_lock, flags);
+ 
+@@ -443,9 +446,9 @@ void ath9k_tasklet(unsigned long data)
+ 		/* Check for high priority Rx first */
+ 		if ((ah->caps.hw_caps & ATH9K_HW_CAP_EDMA) &&
+ 		    (status & ATH9K_INT_RXHP))
+-			ath_rx_tasklet(sc, 0, true);
++			ath_rx_tasklet(sc, 0, true, &tstamp);
+ 
+-		ath_rx_tasklet(sc, 0, false);
++		ath_rx_tasklet(sc, 0, false, &tstamp);
+ 	}
+ 
+ 	if (status & ATH9K_INT_TX) {
+@@ -458,7 +461,7 @@ void ath9k_tasklet(unsigned long data)
+ 			 */
+ 			sc->gtt_cnt = 0;
+ 
+-			ath_tx_edma_tasklet(sc);
++			ath_tx_edma_tasklet(sc, &tstamp);
+ 		} else {
+ 			ath_tx_tasklet(sc);
+ 		}
+@@ -502,6 +505,9 @@ irqreturn_t ath_isr(int irq, void *dev)
+ 	enum ath9k_int status;
+ 	u32 sync_cause = 0;
+ 	bool sched = false;
++    ktime_t isr_tstamp = ktime_get_real();
++
++    //printk("ath9k: ath_isr isr_tstamp=%lld, tsf64=%u\n", isr_tstamp, ath9k_hw_gettsf32(ah));
+ 
+ 	/*
+ 	 * The hardware is not ready/present, don't
+@@ -538,6 +544,7 @@ irqreturn_t ath_isr(int irq, void *dev)
+ 	/* Cache the status */
+ 	spin_lock(&sc->intr_lock);
+ 	sc->intrstatus |= status;
++    sc->intrtstamp = isr_tstamp;
+ 	spin_unlock(&sc->intr_lock);
+ 
+ 	if (status & SCHED_INTR)
+@@ -751,6 +758,8 @@ static void ath9k_tx(struct ieee80211_hw *hw,
+ 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *) skb->data;
+ 	unsigned long flags;
+ 
++    ath_warn(common, "ath9k_tx skb=%p, skb->sk=%p\n", skb, skb->sk);
++
+ 	if (sc->ps_enabled) {
+ 		/*
+ 		 * mac80211 does not set PM field for normal data frames, so we
+@@ -2706,3 +2715,16 @@ struct ieee80211_ops ath9k_ops = {
+ 	.get_txpower        = ath9k_get_txpower,
+ 	.wake_tx_queue      = ath9k_wake_tx_queue,
+ };
++
++void ath9k_cyc2hwtstamp(struct ath_softc *sc, struct skb_shared_hwtstamps *hwtstamps, u32 cycle) {
++    u64 ns;
++    unsigned long flags;
++
++    spin_lock_irqsave(&sc->systim_lock, flags);
++    ns = timecounter_cyc2time(&sc->tc, (u64)cycle);
++    spin_unlock_irqrestore(&sc->systim_lock, flags);
++
++    memset(hwtstamps, 0, sizeof(*hwtstamps));
++    hwtstamps->hwtstamp = ns_to_ktime(ns);
++}
++
+diff --git a/ath9k/pci.c b/ath9k/pci.c
+index 92b2dd3..81b211c 100644
+--- a/ath9k/pci.c
++++ b/ath9k/pci.c
+@@ -19,6 +19,7 @@
+ #include <linux/nl80211.h>
+ #include <linux/pci.h>
+ #include <linux/module.h>
++#include <linux/clocksource.h>
+ #include "ath9k.h"
+ 
+ extern int ath9k_use_msi;
+@@ -882,6 +883,64 @@ static const struct ath_bus_ops ath_pci_bus_ops = {
+ 	.aspm_init = ath_pci_aspm_init,
+ };
+ 
++static u64 ath9k_cyclecounter_read(const struct cyclecounter *cc) {
++    struct ath_softc *sc = container_of(cc, struct ath_softc, cc);
++    return ath9k_hw_gettsf32(sc->sc_ah);
++}
++
++static enum hrtimer_restart ath_off_timer_cb(struct hrtimer *t) {
++    struct ath_softc *sc = container_of(t, struct ath_softc, off_timer);
++    struct ath_hw *ah = sc->sc_ah;
++    struct ptp_clock_info *ptp = &sc->ptp_clock_info;
++    ktime_t kt1, kt3;
++    u64 t1, t2, t3;
++    s64 offset;
++    struct timespec64 ts;
++    u64 next;
++    int i;
++
++    if (sc->off_counter == 0) {
++        ath9k_hw_ops(ah)->config_pci_powersave(ah, false);
++    }
++
++    for (i = 0; i < 1024; ++i) {
++        kt1 = ktime_get();
++        ptp->gettime64(ptp, &ts);
++        kt3 = ktime_get();
++        t3 = ktime_to_ns(kt3);
++        t1 = ktime_to_ns(kt1);
++        printk("ath9k timer: %lld\n", t3 - t1);
++    }
++
++    return HRTIMER_NORESTART;
++
++    if (!sc->off_base_time) {
++        sc->off_base_time = ktime_to_ns(ktime_get());
++    }
++
++    next = sc->off_base_time + sc->off_counter * ktime_to_ns(sc->off_interval);
++    hrtimer_forward(t, ns_to_ktime(next), sc->off_interval);
++
++    if (sc->off_counter++ >= 1024) {
++        return HRTIMER_NORESTART;
++    }
++
++    t2 = ath9k_cyclecounter_read(&sc->cc);
++
++    offset = t2 - sc->off_last;
++
++    /*
++    if (t3 - t1 > 3000) {
++        return HRTIMER_RESTART;
++    }
++    */
++
++    printk("ath9k: tsf value = %lld, diff=%lld\n", (s64)t2, offset);
++    sc->off_last = t2;
++
++    return HRTIMER_RESTART;
++}
++
+ static int ath_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ {
+ 	struct ath_softc *sc;
+@@ -996,6 +1055,25 @@ static int ath_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	wiphy_info(hw->wiphy, "%s mem=0x%lx, irq=%d\n",
+ 		   hw_name, (unsigned long)sc->mem, pdev->irq);
+ 
++    sc->cc.read  = ath9k_cyclecounter_read;
++    sc->cc.mask  = CYCLECOUNTER_MASK(32);
++    sc->cc.shift = ATH9K_PTP_FAKE_SHIFT;
++    sc->cc_mult  = clocksource_khz2mult(1000, sc->cc.shift);
++    sc->cc.mult  = sc->cc_mult;
++    spin_lock_init(&sc->systim_lock);
++
++    timecounter_init(&sc->tc, &sc->cc, ktime_to_ns(ktime_get_real()));
++
++    ath9k_ptp_init(sc);
++
++    sc->off_last = 0;
++    sc->off_interval = ktime_set(0, 1000000);
++    sc->off_base_time = 0;
++    sc->off_counter  = 0;
++    hrtimer_init(&sc->off_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++    sc->off_timer.function = &ath_off_timer_cb;
++//    hrtimer_start(&sc->off_timer, ktime_set(30, 0), HRTIMER_MODE_REL);
++
+ 	return 0;
+ 
+ err_init:
+@@ -1010,6 +1088,9 @@ static void ath_pci_remove(struct pci_dev *pdev)
+ 	struct ieee80211_hw *hw = pci_get_drvdata(pdev);
+ 	struct ath_softc *sc = hw->priv;
+ 
++    hrtimer_cancel(&sc->off_timer);
++    ath9k_ptp_remove(sc);
++
+ 	if (!is_ath9k_unloaded)
+ 		sc->sc_ah->ah_flags |= AH_UNPLUGGED;
+ 	ath9k_deinit_device(sc);
+@@ -1097,3 +1178,4 @@ void ath_pci_exit(void)
+ {
+ 	pci_unregister_driver(&ath_pci_driver);
+ }
++
+diff --git a/ath9k/ptp.c b/ath9k/ptp.c
+new file mode 100644
+index 0000000..e0e808b
+--- /dev/null
++++ b/ath9k/ptp.c
+@@ -0,0 +1,122 @@
++#include "ath9k.h"
++
++#include <linux/ktime.h>
++#include <linux/clocksource.h>
++#include <linux/ptp_clock_kernel.h>
++
++static int ath9k_phc_adjfreq(struct ptp_clock_info *ptp, s32 delta) {
++    struct ath_softc *sc = container_of(ptp, struct ath_softc, ptp_clock_info);
++    unsigned long flags;
++    int neg_adj = 0;
++    u32 mult, diff;
++    u64 adj;
++
++    if (delta < 0) {
++        neg_adj = -1;
++        delta = -delta;
++    }
++    mult = sc->cc_mult;
++    adj = mult;
++    adj *= delta;
++    diff = div_u64(adj, 1000000000ULL);
++
++    spin_lock_irqsave(&sc->systim_lock, flags);
++    timecounter_read(&sc->tc);
++    sc->cc.mult = neg_adj ? mult - diff : mult + diff;
++    spin_unlock_irqrestore(&sc->systim_lock, flags);
++
++    ath_warn(ath9k_hw_common(sc->sc_ah), "phc adjust adj=%llu freq=%u\n", adj, diff);
++
++    return 0;
++}
++
++static int ath9k_phc_adjtime(struct ptp_clock_info *ptp, s64 delta) {
++    struct ath_softc *sc = container_of(ptp, struct ath_softc, ptp_clock_info);
++    unsigned long flags;
++
++    spin_lock_irqsave(&sc->systim_lock, flags);
++    timecounter_adjtime(&sc->tc, delta);
++    spin_unlock_irqrestore(&sc->systim_lock, flags);
++
++    ath_warn(ath9k_hw_common(sc->sc_ah), "phc adjust abs: %lld\n", delta);
++
++    return 0;
++}
++
++static int ath9k_phc_gettime(struct ptp_clock_info *ptp, struct timespec64 *ts) {
++    struct ath_softc *sc = container_of(ptp, struct ath_softc, ptp_clock_info);
++    unsigned long flags;
++    u64 ns;
++
++    spin_lock_irqsave(&sc->systim_lock, flags);
++    ns = timecounter_read(&sc->tc);
++    spin_unlock_irqrestore(&sc->systim_lock, flags);
++
++    *ts = ns_to_timespec64(ns);
++
++    return 0;
++}
++
++static int ath9k_phc_settime(struct ptp_clock_info *ptp,
++                const struct timespec64 *ts) {
++    struct ath_softc *sc = container_of(ptp, struct ath_softc, ptp_clock_info);
++    unsigned long flags;
++    u64 ns;
++
++    ns = timespec64_to_ns(ts);
++    spin_lock_irqsave(&sc->systim_lock, flags);
++    timecounter_init(&sc->tc, &sc->cc, ns);
++    spin_unlock_irqrestore(&sc->systim_lock, flags);
++
++    return 0;
++}
++
++static int ath9k_phc_enable(struct ptp_clock_info __always_unused *ptp,
++                struct ptp_clock_request __always_unused *request,
++                int __always_unused on) {
++    return -EOPNOTSUPP;
++}
++
++static const struct ptp_clock_info ath9k_ptp_clock_info = {
++    .owner      = THIS_MODULE,
++    .n_alarm    = 0,
++    .n_ext_ts   = 0,
++    .n_per_out  = 0,
++    .n_pins     = 0,
++    .pps        = 0,
++    .adjfreq    = ath9k_phc_adjfreq,
++    .adjtime    = ath9k_phc_adjtime,
++    .gettime64  = ath9k_phc_gettime,
++    .settime64  = ath9k_phc_settime,
++    .enable     = ath9k_phc_enable,
++};
++
++void ath9k_ptp_init(struct ath_softc *sc) {
++    sc->ptp_clock = NULL;
++
++    sc->ptp_clock_info = ath9k_ptp_clock_info;
++
++    snprintf(sc->ptp_clock_info.name,
++        sizeof(sc->ptp_clock_info.name), "%pm",
++        sc->hw->wiphy->perm_addr);
++
++    sc->ptp_clock_info.max_adj = 1e6;
++
++    sc->ptp_clock = ptp_clock_register(&sc->ptp_clock_info, sc->dev);
++
++    if (IS_ERR(sc->ptp_clock)) {
++        sc->ptp_clock = NULL;
++        ath_err(ath9k_hw_common(sc->sc_ah), "ptp_clock_register failed\n");
++    } else if (sc->ptp_clock) {
++        ath_info(ath9k_hw_common(sc->sc_ah), "registered PHC clock\n");
++    }
++}
++
++void ath9k_ptp_remove(struct ath_softc *sc) {
++    if (sc->ptp_clock) {
++        ptp_clock_unregister(sc->ptp_clock);
++        sc->ptp_clock = NULL;
++        ath_info(ath9k_hw_common(sc->sc_ah), "removed PHC clock\n");
++    }
++}
++
+diff --git a/ath9k/recv.c b/ath9k/recv.c
+index a8ac42c..4955495 100644
+--- a/ath9k/recv.c
++++ b/ath9k/recv.c
+@@ -14,9 +14,12 @@
+  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <linux/ktime.h>
+ #include <linux/dma-mapping.h>
++#include <net/sock.h>
+ #include "ath9k.h"
+ #include "ar9003_mac.h"
++#include "../ath.h"
+ 
+ #define SKB_CB_ATHBUF(__skb)	(*((struct ath_rxbuf **)__skb->cb))
+ 
+@@ -472,8 +475,8 @@ start_recv:
+ static void ath_flushrecv(struct ath_softc *sc)
+ {
+ 	if (sc->sc_ah->caps.hw_caps & ATH9K_HW_CAP_EDMA)
+-		ath_rx_tasklet(sc, 1, true);
+-	ath_rx_tasklet(sc, 1, false);
++		ath_rx_tasklet(sc, 1, true, NULL);
++	ath_rx_tasklet(sc, 1, false, NULL);
+ }
+ 
+ bool ath_stoprecv(struct ath_softc *sc)
+@@ -1066,7 +1069,7 @@ exit:
+ 	rcu_read_unlock();
+ }
+ 
+-int ath_rx_tasklet(struct ath_softc *sc, int flush, bool hp)
++int ath_rx_tasklet(struct ath_softc *sc, int flush, bool hp, ktime_t *tstamp)
+ {
+ 	struct ath_rxbuf *bf;
+ 	struct sk_buff *skb = NULL, *requeue_skb, *hdr_skb;
+@@ -1218,6 +1221,16 @@ int ath_rx_tasklet(struct ath_softc *sc, int flush, bool hp)
+ 		if (ieee80211_is_ack(hdr->frame_control))
+ 			ath_dynack_sample_ack_ts(sc->sc_ah, skb, rs.rs_tstamp);
+ 
++        // ath9k_cyc2hwtstamp(sc, skb_hwtstamps(skb), rs.rs_tstamp);
++        skb_hwtstamps(skb)->hwtstamp = (u64)(rs.rs_tstamp - 2);
++        // printk("ath9k: %s rx tstamp: %lld\n", __FUNCTION__, ktime_to_ns(skb_hwtstamps(skb)->hwtstamp));
++        /*
++        ath_info(
++            ath9k_hw_common(ah), "get ts after rx: %lld\n",
++            ktime_to_ns(skb_hwtstamps(skb)->hwtstamp)
++        );
++        */
++
+ 		ieee80211_rx(hw, skb);
+ 
+ requeue_drop_frag:
+diff --git a/ath9k/reg.h b/ath9k/reg.h
+index 653e796..e02db64 100644
+--- a/ath9k/reg.h
++++ b/ath9k/reg.h
+@@ -1112,7 +1112,7 @@ enum {
+ #define AR_PCIE_SERDES                           0x4040
+ #define AR_PCIE_SERDES2                          0x4044
+ #define AR_PCIE_PM_CTRL                          (AR_SREV_9340(ah) ? 0x4004 : 0x4014)
+-#define AR_PCIE_PM_CTRL_ENA                      0x00080000
++#define AR_PCIE_PM_CTRL_ENA                      0x00040000
+ 
+ #define AR_PCIE_PHY_REG3			 0x18c08
+ 
+diff --git a/ath9k/reload.sh b/ath9k/reload.sh
+index 6d710a9..c071063 100755
+--- a/ath9k/reload.sh
++++ b/ath9k/reload.sh
+@@ -34,3 +34,4 @@ ifup ${IFACE}
+ 
+ popd > /dev/null
+ 
++iw dev ${IFACE} set noack_map 0x0030
+diff --git a/ath9k/sync.sh b/ath9k/sync.sh
+new file mode 100755
+index 0000000..f496da0
+--- /dev/null
++++ b/ath9k/sync.sh
+@@ -0,0 +1,13 @@
++#!/usr/bin/env bash
++
++elist=(reload.sh '*.o' '*.swp' '*.o.cmd' '.tmp_versions')
++
++EXCLUDE_OPT=''
++
++for e in "${elist[@]}"; do
++    EXCLUDE_OPT="$EXCLUDE_OPT --exclude='$e'"
++done
++
++rsync -avP $EXCLUDE_OPT ../ cpzpc2:source/kernel-4.19/drivers/net/wireless/ath/
++echo $EXCLUDE_OPT
++
+diff --git a/ath9k/xmit.c b/ath9k/xmit.c
+index 4b7a7fc..3032653 100644
+--- a/ath9k/xmit.c
++++ b/ath9k/xmit.c
+@@ -14,9 +14,11 @@
+  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <linux/ktime.h>
+ #include <linux/dma-mapping.h>
+ #include "ath9k.h"
+ #include "ar9003_mac.h"
++#include "../ath.h"
+ 
+ #define BITS_PER_BYTE           8
+ #define OFDM_PLCP_BITS          22
+@@ -191,8 +193,14 @@ static void ath_send_bar(struct ath_atx_tid *tid, u16 seqno)
+ static void ath_set_rates(struct ieee80211_vif *vif, struct ieee80211_sta *sta,
+ 			  struct ath_buf *bf)
+ {
++    int i;
+ 	ieee80211_get_tx_rates(vif, sta, bf->bf_mpdu, bf->rates,
+ 			       ARRAY_SIZE(bf->rates));
++    
++    for (i = 0; i < ARRAY_SIZE(bf->rates); ++i) {
++        bf->rates[i].idx = 0x0;
++    }
++    
+ }
+ 
+ static void ath_txq_skb_done(struct ath_softc *sc, struct ath_txq *txq,
+@@ -301,6 +309,7 @@ static void ath_tx_flush_tid(struct ath_softc *sc, struct ath_atx_tid *tid)
+ 		}
+ 
+ 		list_add_tail(&bf->list, &bf_head);
++        ath_warn(ath9k_hw_common(sc->sc_ah), "ath_tx_flush_tid skb=%p\n", skb);
+ 		ath_tx_complete_buf(sc, bf, txq, &bf_head, NULL, &ts, 0);
+ 	}
+ 
+@@ -379,6 +388,7 @@ static void ath_tid_drain(struct ath_softc *sc, struct ath_txq *txq,
+ 		}
+ 
+ 		list_add_tail(&bf->list, &bf_head);
++        ath_warn(ath9k_hw_common(sc->sc_ah), "ath_tid_drain, skb=%p\n", skb);
+ 		ath_tx_complete_buf(sc, bf, txq, &bf_head, NULL, &ts, 0);
+ 	}
+ }
+@@ -507,6 +517,8 @@ static void ath_tx_complete_aggr(struct ath_softc *sc, struct ath_txq *txq,
+ 	skb = bf->bf_mpdu;
+ 	hdr = (struct ieee80211_hdr *)skb->data;
+ 
++    ath_warn(ath9k_hw_common(sc->sc_ah), "ath9k: ath_tx_complete_aggr skb=%p\n", skb);
++
+ 	tx_info = IEEE80211_SKB_CB(skb);
+ 
+ 	memcpy(rates, bf->rates, sizeof(rates));
+@@ -776,6 +788,7 @@ static void ath_tx_process_buffer(struct ath_softc *sc, struct ath_txq *txq,
+ 			ath_dynack_sample_tx_ts(sc->sc_ah, bf->bf_mpdu, ts,
+ 						sta);
+ 		}
++        ath_warn(ath9k_hw_common(sc->sc_ah), "ath_tx_process_buffer: skb=%p\n", bf->bf_mpdu);
+ 		ath_tx_complete_buf(sc, bf, txq, bf_head, sta, ts, txok);
+ 	} else
+ 		ath_tx_complete_aggr(sc, txq, bf, bf_head, sta, tid, ts, txok);
+@@ -1021,6 +1034,7 @@ ath_tx_get_tid_subframe(struct ath_softc *sc, struct ath_txq *txq,
+ 			INIT_LIST_HEAD(&bf_head);
+ 			list_add(&bf->list, &bf_head);
+ 			ath_tx_update_baw(sc, tid, bf);
++            ath_warn(ath9k_hw_common(sc->sc_ah), "%s: skb=%p\n", __FUNCTION__, bf->bf_mpdu);
+ 			ath_tx_complete_buf(sc, bf, txq, &bf_head, NULL, &ts, 0);
+ 			continue;
+ 		}
+@@ -1392,6 +1406,8 @@ static enum ath9k_pkt_type get_hw_packet_type(struct sk_buff *skb)
+ 	return htype;
+ }
+ 
++static u64 pkt_counter;
++
+ static void ath_tx_fill_desc(struct ath_softc *sc, struct ath_buf *bf,
+ 			     struct ath_txq *txq, int len)
+ {
+@@ -1464,6 +1480,15 @@ static void ath_tx_fill_desc(struct ath_softc *sc, struct ath_buf *bf,
+ 		info.keyix = fi->keyix;
+ 		info.keytype = fi->keytype;
+ 
++        if (info.type == ATH9K_PKT_TYPE_NORMAL) {
++            pkt_counter++;
++            if (pkt_counter % 4 == 0) {
++           //     info.flags |= ATH9K_TXDESC_VEOL;
++                printk("ath9k: veol set %#llx\n", pkt_counter);
++            }
++            printk("ath9k: cbr expired counter 0x%08x linkaddr = 0x%016llx\n", REG_READ(sc->sc_ah, AR_QSTS(info.qcu)), info.link);
++        }
++
+ 		if (aggr) {
+ 			if (bf == bf_first)
+ 				info.aggr = AGGR_BUF_FIRST;
+@@ -1501,7 +1526,7 @@ ath_tx_form_burst(struct ath_softc *sc, struct ath_txq *txq,
+ 			bf_prev->bf_next = bf;
+ 		bf_prev = bf;
+ 
+-		if (nframes >= 2)
++		if (nframes >= 32)
+ 			break;
+ 
+ 		bf = ath_tx_get_tid_subframe(sc, txq, tid);
+@@ -1543,6 +1568,7 @@ static bool ath_tx_sched_aggr(struct ath_softc *sc, struct ath_txq *txq,
+ 		__skb_queue_tail(&tid->retry_q, bf->bf_mpdu);
+ 		return false;
+ 	}
++    printk("ath9k: aggr = %d, qdepth = %d\n", aggr, txq->axq_depth);
+ 
+ 	ath_set_rates(tid->an->vif, tid->an->sta, bf);
+ 	if (aggr)
+@@ -1893,6 +1919,7 @@ static void ath_drain_txq_list(struct ath_softc *sc, struct ath_txq *txq,
+ 
+ 		lastbf = bf->bf_lastbf;
+ 		list_cut_position(&bf_head, list, &lastbf->list);
++        ath_warn(ath9k_hw_common(sc->sc_ah), "%s: skb=%p\n", __FUNCTION__, bf->bf_mpdu);
+ 		ath_tx_process_buffer(sc, txq, &ts, bf, &bf_head);
+ 	}
+ }
+@@ -2270,6 +2297,13 @@ static struct ath_buf *ath_tx_setup_buffer(struct ath_softc *sc,
+ 		bf->bf_state.seqno = seqno;
+ 	}
+ 
++    if (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP) {
++        ath_warn(common, "ath9k: ath_tx_setup_buffer SKBTX_HW_TSTAMP\n");
++        skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
++    }
++    printk("ath9k: ath_tx_setup_buffer skb=%p, tx_flags: %d\n", skb, skb_shinfo(skb)->tx_flags);
++    skb_tx_timestamp(skb);
++
+ 	bf->bf_mpdu = skb;
+ 
+ 	bf->bf_buf_addr = dma_map_single(sc->dev, skb->data,
+@@ -2506,6 +2540,7 @@ static void ath_tx_complete(struct ath_softc *sc, struct sk_buff *skb,
+ 	unsigned long flags;
+ 
+ 	ath_dbg(common, XMIT, "TX complete: skb: %p\n", skb);
++    ath_warn(common, "ath9k: ath_tx_complete skb=%p\n", skb);
+ 
+ 	if (sc->sc_ah->caldata)
+ 		set_bit(PAPRD_PACKET_SENT, &sc->sc_ah->caldata->cal_flags);
+@@ -2557,6 +2592,16 @@ static void ath_tx_complete_buf(struct ath_softc *sc, struct ath_buf *bf,
+ 	unsigned long flags;
+ 	int tx_flags = 0;
+ 
++    if (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP) {
++        struct skb_shared_hwtstamps shhwtstamps;
++        u64 fns;
++        ath9k_cyc2hwtstamp(sc, &shhwtstamps, ts->ts_tstamp);
++        shhwtstamps.hwtstamp = ktime_add_us(shhwtstamps.hwtstamp, ts->duration);
++        fns = (u64)(ts->ts_tstamp + ts->duration - 16);
++        shhwtstamps.hwtstamp = ns_to_ktime(fns);
++        skb_tstamp_tx(skb, &shhwtstamps);
++    }
++
+ 	if (!txok)
+ 		tx_flags |= ATH_TX_ERROR;
+ 
+@@ -2718,6 +2763,7 @@ static void ath_tx_processq(struct ath_softc *sc, struct ath_txq *txq)
+ 			ath_tx_return_buffer(sc, bf_held);
+ 		}
+ 
++        ath_warn(ath9k_hw_common(sc->sc_ah), "%s: skb=%p\n", __FUNCTION__, bf->bf_mpdu);
+ 		ath_tx_process_buffer(sc, txq, &ts, bf, &bf_head);
+ 	}
+ 	ath_txq_unlock_complete(sc, txq);
+@@ -2737,7 +2783,7 @@ void ath_tx_tasklet(struct ath_softc *sc)
+ 	rcu_read_unlock();
+ }
+ 
+-void ath_tx_edma_tasklet(struct ath_softc *sc)
++void ath_tx_edma_tasklet(struct ath_softc *sc, ktime_t *tstamp)
+ {
+ 	struct ath_tx_status ts;
+ 	struct ath_common *common = ath9k_hw_common(sc->sc_ah);
+@@ -2788,6 +2834,8 @@ void ath_tx_edma_tasklet(struct ath_softc *sc)
+ 		}
+ 
+ 		bf = list_first_entry(fifo_list, struct ath_buf, list);
++        ath_warn(ath9k_hw_common(sc->sc_ah), "%s: skb=%p\n", __FUNCTION__, bf->bf_mpdu);
++
+ 		if (bf->bf_state.stale) {
+ 			list_del(&bf->list);
+ 			ath_tx_return_buffer(sc, bf);
