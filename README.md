@@ -15,11 +15,7 @@ The `ath9k` directory contains the modified ath9k driver based on Linux Kernel 4
 
 ### Build & Replace ath9k Driver
 
-1. Replace `drivers/net/wireless/ath/ath9k` in the Kernel source tree with this repo's `ath9k`. We recommend `rsync` to do this:
-
-```bash
-    rsync -avP <repo path>/ath9k <kernel source>/drivers/net/wireless/ath/
-```
+1. Patch `drivers/net/wireless/ath` in the Kernel source tree with this repo's `ath9k.diff`. We recommend `patch` to do this.
 
 2. Build ath9k driver.
 
