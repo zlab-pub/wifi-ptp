@@ -1,9 +1,9 @@
 
-Wi-PTP
+Wi-Fi PTP (Wi-PTP)
 
-## Abstract
+## Brief
 
-Emerging mobile applications involving distributed control and sensing call for accurate time synchronization over wireless links. This paper systematically studies the performance of Precision Time Protocol (PTP) in today's Wi-Fi networks. We investigate both software and hardware PTP implementations. Our study uncovers the root causes of software PTP synchronization errors. We show that with fine-tuned system configurations and an online calibration procedure, software PTP can achieve reasonable accuracy with off-the-shelf Wi-Fi devices. Hardware PTP requires a PTP hardware timestamper clock not contained in Wi-Fi NICs. We propose a method to make use of the hardware TSF counter to emulate the PTP clock. Rigorous tests traversing various conditions show that both software and hardware PTP implementations can achieve a 1-μs level of accuracy in today's Wi-Fi networks.
+This project implements Precision Time Protocol (PTP) for Wi-Fi. Likely to be used in time-sensitive WLAN, UAV, etc., Original PTP is designed for LAN but it is possible to port it to Wi-Fi. The simplest way is to timestamp PTP packets in the NIC driver but is subject to several software uncertainties. This project makes use of the hardware TSF counter to emulate the hardware PTP clock like Ethernet NICs. A standard PTP clock interface is implemented in `ath9k`. Its performance is at 1 μs level. More details can be found in the [ATC'21 paper](https://www.usenix.org/system/files/atc21-chen.pdf).  
 
 ![Wi-PTP Implementation Overview](figures/Wi-PTP-impl.png)
 
@@ -69,8 +69,6 @@ The above command should output a `ptp<X>`.
 After building the `linuxptp`, the ar9300+ wireless cards can be used to perform PTP as ethernet cards.
 
 ## Citation
-
-Use this bibtex to cite the paper:
 
 ```plain
 @inproceedings {273763,
