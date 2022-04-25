@@ -117,7 +117,6 @@ struct sync_msg {
 struct delay_req_msg {
 	struct ptp_header   hdr;
 	struct Timestamp    originTimestamp;
-    uint8_t             __padding[16];
 	uint8_t             suffix[0];
 } PACKED;
 

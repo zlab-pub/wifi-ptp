@@ -1367,7 +1367,6 @@ int port_tx_announce(struct port *p, struct address *dst)
 		pr_err("port %hu: append path trace failed", portnum(p));
 	}
 
-    system("echo a | ncat -u 192.168.0.162 320");
 	err = port_prepare_and_send(p, msg, TRANS_GENERAL);
 	if (err) {
 		pr_err("port %hu: send announce failed", portnum(p));
@@ -1431,7 +1430,6 @@ int port_tx_sync(struct port *p, struct address *dst)
         }
     }
 
-    system("echo a | ncat -u 192.168.0.162 319");
     err = port_prepare_and_send_batch(p, burst, S_BURST_SIZE, TRANS_DEFER_EVENT);
     if (err) {
         pr_err("port %hu: send sync failed", portnum(p));
@@ -1459,7 +1457,6 @@ int port_tx_sync(struct port *p, struct address *dst)
 	/*
 	 * Send the follow up message right away.
 	 */
-    system("echo a | ncat -u 192.168.0.162 320");
     for (i = 0; i < len; ++i) {
         msg = burst[i];
         fup->hwts.type = p->timestamping;
@@ -2547,8 +2544,6 @@ static enum fsm_event bc_event(struct port *p, int fd_index)
 
 	switch (fd_index) {
 	case FD_ANNOUNCE_TIMER:
-        port_clr_tmo(p->fda.fd[FD_ANNOUNCE_TIMER]);
-        return EV_NONE;
 	case FD_SYNC_RX_TIMER:
 		pr_debug("port %hu: %s timeout", portnum(p),
 			 fd_index == FD_SYNC_RX_TIMER ? "rx sync" : "announce");
@@ -2625,7 +2620,6 @@ static enum fsm_event bc_event(struct port *p, int fd_index)
 			return EV_NONE;
 	}
 
-    pr_debug("non timer event");
 	msg = msg_allocate();
 	if (!msg)
 		return EV_FAULT_DETECTED;
@@ -2652,7 +2646,6 @@ static enum fsm_event bc_event(struct port *p, int fd_index)
 		return EV_NONE;
 	}
 	if (port_ignore(p, msg)) {
-        pr_warning("msg ignored");
 		msg_put(msg);
 		return EV_NONE;
 	}
@@ -2668,10 +2661,8 @@ static enum fsm_event bc_event(struct port *p, int fd_index)
 		clock_check_ts(p->clock, tmv_to_nanoseconds(msg->hwts.ts));
 	}
 
-    pr_debug("msg type: %d", msg_type(msg));
 	switch (msg_type(msg)) {
 	case SYNC:
-        pr_debug("got sync");
 		process_sync(p, msg);
 		break;
 	case DELAY_REQ:
@@ -2687,7 +2678,6 @@ static enum fsm_event bc_event(struct port *p, int fd_index)
 			event = EV_FAULT_DETECTED;
 		break;
 	case FOLLOW_UP:
-        pr_debug("got fup");
 		process_follow_up(p, msg);
 		break;
 	case DELAY_RESP:
@@ -2697,7 +2687,6 @@ static enum fsm_event bc_event(struct port *p, int fd_index)
 		process_pdelay_resp_fup(p, msg);
 		break;
 	case ANNOUNCE:
-        pr_debug("got announce");
 		if (process_announce(p, msg))
 			event = EV_STATE_DECISION_EVENT;
 		break;
@@ -2707,12 +2696,10 @@ static enum fsm_event bc_event(struct port *p, int fd_index)
 		}
 		break;
 	case MANAGEMENT:
-        pr_debug("got mgmt");
 		if (clock_manage(p->clock, p, msg))
 			event = EV_STATE_DECISION_EVENT;
 		break;
 	}
-    pr_debug("event done");
 
 	msg_put(msg);
 	return event;
@@ -3368,17 +3355,14 @@ int port_burst_lsm(struct port *p, struct ptp_message *burst[], int burst_size, 
     xbase = msg_seq(burst[0]);
     ybase = msg_tsns(burst[0]);
 
-//    fprintf(stderr, "ry: ");
     for (i = 0; i < burst_size; ++i) {
         int64_t x = msg_seq(burst[i]) - xbase;
         int64_t y = msg_tsns(burst[i]) - ybase;
-//        fprintf(stderr, "%ld ", y);
         xy   += x * y;
         xsum += x;
         ysum += y;
         xx   += x * x;
     }
-//    fprintf(stderr, "\n");
 
     xbar = ((double)xsum) / burst_size;
     ybar = ((double)ysum) / burst_size;
@@ -3403,11 +3387,6 @@ int port_burst_lsm(struct port *p, struct ptp_message *burst[], int burst_size, 
 
 //    intercept += maxd;
 //        fprintf(stderr, "{ %ld, %ld, %ld },", x, y + ybase, y + ybase - msg_tsns(burst[i]));
-//    {
-//        int64_t x = msg_seq(burst[0]) - xbase;
-//        int64_t y = slope * x + intercept;
-//        fprintf(stderr, "slope = %lf, intercept = %lf, dy = %ld\n", slope, intercept, msg_tsns(burst[0]) - (y + ybase));
-//    }
     for (i = 0; i < burst_size; ++i) {
         int64_t x = msg_seq(burst[i]) - xbase;
         int64_t y = slope * x + intercept;

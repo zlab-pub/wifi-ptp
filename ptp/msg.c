@@ -339,10 +339,8 @@ int msg_post_recv(struct ptp_message *m, int cnt)
 {
 	int pdulen, type, err;
 
-	if (cnt < sizeof(struct ptp_header)) {
-        pr_err("cnt error %d, %zu", cnt, sizeof(struct ptp_header));
+	if (cnt < sizeof(struct ptp_header))
 		return -EBADMSG;
-    }
 
 	err = hdr_post_recv(&m->header);
 	if (err)
@@ -382,14 +380,11 @@ int msg_post_recv(struct ptp_message *m, int cnt)
 		pdulen = sizeof(struct management_msg);
 		break;
 	default:
-        pr_err("type error");
 		return -EBADMSG;
 	}
 
-	if (cnt < pdulen) {
-        pr_err("pdu error %d, %d", cnt, pdulen);
+	if (cnt < pdulen)
 		return -EBADMSG;
-    }
 
 	switch (type) {
 	case SYNC:
@@ -428,10 +423,8 @@ int msg_post_recv(struct ptp_message *m, int cnt)
 	}
 
 	err = suffix_post_recv(m, cnt - pdulen);
-	if (err) {
-        pr_err("suffix post recv error");
+	if (err)
 		return err;
-    }
 
 	return 0;
 }

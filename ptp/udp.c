@@ -118,12 +118,12 @@ static int open_socket(const char *name, struct in_addr mc_addr[2], short port,
 		pr_err("bind failed: %m");
 		goto no_option;
 	}
-    /*
+
 	if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, name, strlen(name))) {
 		pr_err("setsockopt SO_BINDTODEVICE failed: %m");
 		goto no_option;
 	}
-    */
+
 	if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl))) {
 		pr_err("setsockopt IP_MULTICAST_TTL failed: %m");
 		goto no_option;
@@ -187,8 +187,6 @@ static int udp_open(struct transport *t, struct interface *iface,
 	if (sk_general_init(gfd))
 		goto no_timestamping;
 
-    fcntl(gfd, F_SETFL, fcntl(gfd, F_GETFL) | O_NONBLOCK);
-
 	event_dscp = config_get_int(t->cfg, NULL, "dscp_event");
 	general_dscp = config_get_int(t->cfg, NULL, "dscp_general");
 
@@ -198,10 +196,6 @@ static int udp_open(struct transport *t, struct interface *iface,
 	if (general_dscp && sk_set_priority(gfd, AF_INET, general_dscp)) {
 		pr_warning("Failed to set general DSCP priority.");
 	}
-
-    t->phyno = extract_phyno(iface->name);
-    t->efd = efd;
-    t->gfd = gfd;
 
 	fda->fd[FD_EVENT] = efd;
 	fda->fd[FD_GENERAL] = gfd;
@@ -215,51 +209,9 @@ no_event:
 	return -1;
 }
 
-static int read_debugfs(int phyno, int port, void *buf, int buflen, struct hw_timestamp *hwts) {
-    uint64_t ns;
-    char tmp[128];
-    int len;
-    int fd;
-    char dbgpath[512];
-
-    snprintf(dbgpath, sizeof dbgpath, "/sys/kernel/debug/ieee80211/phy%d/ath9k/promisc_%d", phyno, port);
-    fd = open(dbgpath, O_RDONLY);
-    if (fd < 0) {
-        abort();
-    }
-    len = read(fd, tmp, sizeof tmp);
-    if (len < 0) {
-        abort();
-    }
-    close(fd);
-
-    memcpy(&ns, tmp, sizeof ns);
-    len -= sizeof ns;
-    if (len > buflen) {
-        len = buflen;
-    }
-    memcpy(buf, tmp + sizeof ns, len);
-
-    hwts->ts.ns = ns * 1000;
-
-    return len;
-}
-
-static int TryAgain(int ret) {
-    return ret == EWOULDBLOCK || ret == EAGAIN;
-}
-
 static int udp_recv(struct transport *t, int fd, void *buf, int buflen,
 		    struct address *addr, struct hw_timestamp *hwts)
 {
-    char tmp[1024];
-    if (fd == t->gfd) {
-        while(TryAgain(read(fd, tmp, sizeof tmp)))
-            ;
-    } else {
-        read(fd, tmp, sizeof tmp);
-    }
-    return read_debugfs(t->phyno, fd == t->gfd ? 320 : 319, buf, buflen, hwts);
 	return sk_receive(fd, buf, buflen, addr, hwts, 0);
 }
 

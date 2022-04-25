@@ -29,9 +29,6 @@
 struct transport {
 	enum transport_type type;
 	struct config *cfg;
-    int phyno;
-    int efd;
-    int gfd;
 
 	int (*close)(struct transport *t, struct fdarray *fda);
 
