@@ -58,7 +58,7 @@ Note: please replace the `wlan0` above with the actual ath9k interface.
 
 The above command should output a `ptp<X>`.
 
-### Build linuxptp
+### Build linuxptp (use the ptp version in this repo, we modified it to disable PTP capability checking)
 
 ```bash
     cd <repo path>/ptp
