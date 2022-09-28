@@ -11,28 +11,6 @@ index f71b2ad..0c8a7f1 100644
  ath9k-$(CONFIG_ATH9K_AHB) += ahb.o
  ath9k-$(CONFIG_ATH9K_DFS_DEBUGFS) += dfs_debug.o
  ath9k-$(CONFIG_ATH9K_DFS_CERTIFIED) += dfs.o
-diff --git a/ath9k/ar9003_2p2_initvals.h b/ath9k/ar9003_2p2_initvals.h
-index c07866a..6b3c048 100644
---- a/ath9k/ar9003_2p2_initvals.h
-+++ b/ath9k/ar9003_2p2_initvals.h
-@@ -304,7 +304,7 @@ static const u32 ar9300_2p2_mac_postamble[][5] = {
- 	{0x00008014, 0x03e803e8, 0x07d007d0, 0x10801600, 0x08400b00},
- 	{0x0000801c, 0x128d8027, 0x128d804f, 0x12e00057, 0x12e0002b},
- 	{0x00008120, 0x18f04800, 0x18f04800, 0x18f04810, 0x18f04810},
--	{0x000081d0, 0x00003210, 0x00003210, 0x0000320a, 0x0000320a},
-+	{0x000081d0, 0x00003010, 0x00003010, 0x0000300a, 0x0000300a},
- 	{0x00008318, 0x00003e80, 0x00007d00, 0x00006880, 0x00003440},
- };
- 
-@@ -1310,7 +1310,7 @@ static const u32 ar9300_2p2_mac_core[][2] = {
- 	{0x0000105c, 0x002ffc0f},
- 	{0x00001060, 0x002ffc0f},
- 	{0x00001064, 0x002ffc0f},
--	{0x000010f0, 0x00000100},
-+	{0x000010f0, 0x0a000100},
- 	{0x00001270, 0x00000000},
- 	{0x000012b0, 0x00000000},
- 	{0x000012f0, 0x00000000},
 diff --git a/ath9k/ath9k.h b/ath9k/ath9k.h
 index 0fca44e..8f41cec 100644
 --- a/ath9k/ath9k.h
