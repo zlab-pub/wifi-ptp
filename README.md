@@ -64,7 +64,7 @@ The `ath9k` directory contains the modified ath9k driver based on Linux Kernel 4
 
 ### Build linuxptp
 
-The ptp version in this repo is modified to disable PTP capability checking. Our modified version based on the commit [dd30b3a](https://github.com/richardcochran/linuxptp/tree/dd30b3a0d94d1c087066066e5df6bc84e3019b0b). We also provide a file `linuxptp.patch`, which is the diff information between the commit `dd30b3a` and our modified linuxptp.
+The ptp version in this repo is modified to disable PTP capability checking and implement the **PHC function in a relatively simple but improper way**. The modified version is based on the commit [dd30b3a](https://github.com/richardcochran/linuxptp/tree/dd30b3a0d94d1c087066066e5df6bc84e3019b0b). We also provide a file `linuxptp.patch`, which is the diff information between the commit `dd30b3a` and our modified linuxptp.
 
 ```bash
 cd <repo path>/ptp
