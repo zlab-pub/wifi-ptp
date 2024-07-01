@@ -735,34 +735,6 @@ index 653e796..e02db64 100644
  
  #define AR_PCIE_PHY_REG3			 0x18c08
  
-diff --git a/ath9k/reload.sh b/ath9k/reload.sh
-index 6d710a9..c071063 100755
---- a/ath9k/reload.sh
-+++ b/ath9k/reload.sh
-@@ -34,3 +34,4 @@ ifup ${IFACE}
- 
- popd > /dev/null
- 
-+iw dev ${IFACE} set noack_map 0x0030
-diff --git a/ath9k/sync.sh b/ath9k/sync.sh
-new file mode 100755
-index 0000000..f496da0
---- /dev/null
-+++ b/ath9k/sync.sh
-@@ -0,0 +1,13 @@
-+#!/usr/bin/env bash
-+
-+elist=(reload.sh '*.o' '*.swp' '*.o.cmd' '.tmp_versions')
-+
-+EXCLUDE_OPT=''
-+
-+for e in "${elist[@]}"; do
-+    EXCLUDE_OPT="$EXCLUDE_OPT --exclude='$e'"
-+done
-+
-+rsync -avP $EXCLUDE_OPT ../ cpzpc2:source/kernel-4.19/drivers/net/wireless/ath/
-+echo $EXCLUDE_OPT
-+
 diff --git a/ath9k/xmit.c b/ath9k/xmit.c
 index 4b7a7fc..3032653 100644
 --- a/ath9k/xmit.c
