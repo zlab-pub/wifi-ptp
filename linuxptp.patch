@@ -1,0 +1,1754 @@
+diff '--color=auto' -ur -x .git linuxptp/clock.c wifi-ptp/ptp/clock.c
+--- linuxptp/clock.c	2024-06-24 23:24:58.513636367 +0800
++++ wifi-ptp/ptp/clock.c	2023-06-29 20:22:18.000000000 +0800
+@@ -46,6 +46,7 @@
+ 
+ #define N_CLOCK_PFD (N_POLLFD + 1) /* one extra per port, for the fault timer */
+ #define POW2_41 ((double)(1ULL << 41))
++#define WINSIZE 8
+ 
+ struct port {
+ 	LIST_ENTRY(port) list;
+@@ -123,6 +124,11 @@
+ 	int stats_interval;
+ 	struct clockcheck *sanity_check;
+ 	struct interface uds_interface;
++
++    int64_t offset_window[WINSIZE];
++    int offset_idx;
++    int offset_first;
++
+ 	LIST_HEAD(clock_subscribers_head, clock_subscriber) subscribers;
+ };
+ 
+@@ -592,7 +598,7 @@
+ 	if (c->stats.max_count > 1) {
+ 		clock_stats_update(&c->stats, tmv_dbl(c->master_offset), freq);
+ 	} else {
+-		pr_info("master offset %10" PRId64 " s%d freq %+7.0f "
++		pr_info("no adjust master offset %10" PRId64 " s%d freq %+7.0f "
+ 			"path delay %9" PRId64,
+ 			tmv_to_nanoseconds(c->master_offset), state, freq,
+ 			tmv_to_nanoseconds(c->path_delay));
+@@ -966,7 +972,7 @@
+ 		    ((iface->ts_info.so_timestamping & required_modes) != required_modes)) {
+ 			pr_err("interface '%s' does not support "
+ 			       "requested timestamping mode", iface->name);
+-			return NULL;
++			//return NULL;
+ 		}
+ 	}
+ 
+@@ -978,10 +984,12 @@
+ 	} else if (timestamping == TS_SOFTWARE || timestamping == TS_LEGACY_HW) {
+ 		phc_index = -1;
+ 	} else if (phc_device) {
++        pr_err("phc_device: %s", phc_device);
+ 		if (1 != sscanf(phc_device, "/dev/ptp%d", &phc_index)) {
+ 			phc_index = -1;
+ 		}
+ 	} else if (iface->ts_info.valid) {
++        pr_err("phc_device: %d", iface->ts_info.phc_index);
+ 		phc_index = iface->ts_info.phc_index;
+ 	} else {
+ 		pr_err("PTP device not specified and automatic determination"
+@@ -1076,6 +1084,7 @@
+ 		/* Due to a bug in older kernels, the reading may silently fail
+ 		   and return 0. Set the frequency back to make sure fadj is
+ 		   the actual frequency of the clock. */
++        fadj = 0;
+ 		clockadj_set_freq(c->clkid, fadj);
+ 	}
+ 	c->servo = servo_create(c->config, servo, -fadj, max_adj, sw_ts);
+@@ -1158,6 +1167,9 @@
+ 	}
+ 	port_dispatch(c->uds_port, EV_INITIALIZE, 0);
+ 
++    c->offset_idx = 0;
++    c->offset_first = 1;
++
+ 	return c;
+ }
+ 
+@@ -1570,6 +1582,17 @@
+ 		stats_add_value(c->stats.delay, tmv_dbl(c->path_delay));
+ }
+ 
++void clock_path_delay_force(struct clock *c, tmv_t d)
++{
++    c->path_delay = d;
++    tsproc_set_delay(c->tsproc, d);
++
++	c->cur.meanPathDelay = tmv_to_TimeInterval(c->path_delay);
++
++	if (c->stats.delay)
++		stats_add_value(c->stats.delay, tmv_dbl(c->path_delay));
++}
++
+ void clock_peer_delay(struct clock *c, tmv_t ppd, tmv_t req, tmv_t rx,
+ 		      double nrr)
+ {
+@@ -1633,10 +1656,48 @@
+ 	return 0;
+ }
+ 
++static int64_t absi64(int64_t n) {
++    return n > 0 ? n : -n;
++}
++
++static int clock_offset_slide_window(struct clock *c, int64_t *mofft) {
++    int64_t *offw = c->offset_window;
++    int max_idx, j, sum;
++
++    if (c->offset_first) {
++        c->offset_first = 0;
++        return 1;
++    }
++
++    offw[c->offset_idx++] = *mofft;
++    if (c->offset_idx < WINSIZE) {
++        return 0;
++    }
++    for (j = 0; j < 2; ++j) {
++        int64_t max = 0;
++        int i;
++        sum = 0;
++        for (i = 0; i < WINSIZE; ++i) {
++            sum += offw[i];
++            if (max < absi64(offw[i])) {
++                max_idx = i;
++                max = absi64(offw[i]);
++            }
++        }
++        sum -= max;
++        offw[max_idx] = 0;
++    }
++    *mofft = sum / (WINSIZE - 2);
++    c->offset_idx = 0;
++    return 1;
++}
++
+ enum servo_state clock_synchronize(struct clock *c, tmv_t ingress, tmv_t origin)
+ {
+-	double adj, weight;
++	double adj = 0.0, weight;
+ 	enum servo_state state = SERVO_UNLOCKED;
++    int64_t adj_mofft;
++    int not_skip_sync;
+ 
+ 	c->ingress_ts = ingress;
+ 
+@@ -1660,14 +1721,26 @@
+ 		return clock_no_adjust(c, ingress, origin);
+ 	}
+ 
+-	adj = servo_sample(c->servo, tmv_to_nanoseconds(c->master_offset),
+-			   tmv_to_nanoseconds(ingress), weight, &state);
+-	c->servo_state = state;
++    adj_mofft = tmv_to_nanoseconds(c->master_offset);
++    not_skip_sync = 1;
++
++    /*
++    if (c->servo_state == SERVO_LOCKED && absi64(adj_mofft) >= 2000) {
++        not_skip_sync = 0;
++        return c->servo_state;
++    }
++    */
++
++    if (not_skip_sync) {
++        adj = servo_sample(c->servo, adj_mofft,
++                   tmv_to_nanoseconds(ingress), weight, &state);
++        c->servo_state = state;
++    }
+ 
+ 	if (c->stats.max_count > 1) {
+ 		clock_stats_update(&c->stats, tmv_dbl(c->master_offset), adj);
+ 	} else {
+-		pr_info("master offset %10" PRId64 " s%d freq %+7.0f "
++		pr_info("clock update master offset %10" PRId64 " s%d freq %+7.0f "
+ 			"path delay %9" PRId64,
+ 			tmv_to_nanoseconds(c->master_offset), state, adj,
+ 			tmv_to_nanoseconds(c->path_delay));
+@@ -1675,7 +1748,10 @@
+ 
+ 	tsproc_set_clock_rate_ratio(c->tsproc, clock_rate_ratio(c));
+ 
+-	switch (state) {
++    if (!not_skip_sync) {
++        return c->servo_state;
++    }
++	switch (c->servo_state) {
+ 	case SERVO_UNLOCKED:
+ 		break;
+ 	case SERVO_JUMP:
+@@ -1691,6 +1767,7 @@
+ 		break;
+ 	case SERVO_LOCKED:
+ 		clockadj_set_freq(c->clkid, -adj);
++		//clockadj_step(c->clkid, -tmv_to_nanoseconds(c->master_offset));
+ 		if (c->clkid == CLOCK_REALTIME) {
+ 			sysclk_set_sync();
+ 		}
+@@ -1699,6 +1776,7 @@
+ 		}
+ 		break;
+ 	}
++__clock_sync_out:
+ 	return state;
+ }
+ 
+@@ -1835,3 +1913,7 @@
+ 	}
+ 	return servo_rate_ratio(c->servo);
+ }
++
++clockid_t clock_clockid(struct clock *c) {
++    return c->clkid;
++}
+diff '--color=auto' -ur -x .git linuxptp/clock.h wifi-ptp/ptp/clock.h
+--- linuxptp/clock.h	2024-06-24 23:24:58.513636367 +0800
++++ wifi-ptp/ptp/clock.h	2023-06-29 20:22:18.000000000 +0800
+@@ -345,4 +345,8 @@
+  */
+ double clock_rate_ratio(struct clock *c);
+ 
++clockid_t clock_clockid(struct clock *c);
++
++void clock_path_delay_force(struct clock *c, tmv_t d);
++
+ #endif
+diff '--color=auto' -ur -x .git linuxptp/config.c wifi-ptp/ptp/config.c
+--- linuxptp/config.c	2024-06-24 23:24:58.513636367 +0800
++++ wifi-ptp/ptp/config.c	2023-06-29 20:22:18.000000000 +0800
+@@ -279,6 +279,8 @@
+ 	PORT_ITEM_STR("p2p_dst_mac", "01:80:C2:00:00:0E"),
+ 	GLOB_ITEM_STR("revisionData", ";;"),
+ 	GLOB_ITEM_INT("sanity_freq_limit", 200000000, 0, INT_MAX),
++    PORT_ITEM_STR("slave_unicast", ""),
++    PORT_ITEM_INT("fixed_delay", 0, 0, INT_MAX),
+ 	GLOB_ITEM_INT("slaveOnly", 0, 0, 1),
+ 	GLOB_ITEM_DBL("step_threshold", 0.0, 0.0, DBL_MAX),
+ 	GLOB_ITEM_INT("summary_interval", 0, INT_MIN, INT_MAX),
+diff '--color=auto' -ur -x .git linuxptp/config.h wifi-ptp/ptp/config.h
+--- linuxptp/config.h	2024-06-24 23:24:58.513636367 +0800
++++ wifi-ptp/ptp/config.h	2023-06-29 20:22:18.000000000 +0800
+@@ -33,6 +33,10 @@
+ 
+ #define MAX_IFNAME_SIZE 108 /* = UNIX_PATH_MAX */
+ 
++#define BURST_SIZE 32
++#define D_BURST_SIZE 1
++#define S_BURST_SIZE 1
++
+ #if (IF_NAMESIZE > MAX_IFNAME_SIZE)
+ #error if_namesize larger than expected.
+ #endif
+diff '--color=auto' -ur -x .git linuxptp/linreg.c wifi-ptp/ptp/linreg.c
+--- linuxptp/linreg.c	2024-06-24 23:24:58.513636367 +0800
++++ wifi-ptp/ptp/linreg.c	2023-06-29 20:22:18.000000000 +0800
+@@ -81,6 +81,17 @@
+ 	double frequency_ratio;
+ 	/* Upcoming leap second */
+ 	int leap;
++
++    /* Smoothed frequency offset */
++    double smoothed_slope;
++    double dev_freq;
++    /* Smoothing coefficient */
++    double smoothing_coef;
++    double dev_coef;
++    /* Smoothing counter */
++    size_t smoothing_size;
++    /* Smoothing threshold */
++    size_t smoothing_threshold;
+ };
+ 
+ static void linreg_destroy(struct servo *servo)
+@@ -186,9 +197,29 @@
+ 		res->slope = (xy_sum - x_sum * y_sum / w_sum) /
+ 				(x2_sum - x_sum * x_sum / w_sum);
+ 		res->intercept = (y_sum - res->slope * x_sum) / w_sum;
++
+ 	}
+ }
+ 
++static void smooth_slope(struct linreg_servo *s, double *slope) {
++    double *sslope = &s->smoothed_slope;
++    double *dfreq = &s->dev_freq;
++    s->smoothing_size++;
++    if (s->smoothing_size <= s->smoothing_threshold) {
++        *sslope += *slope;
++        if (s->smoothing_size == s->smoothing_threshold) {
++            *sslope /= s->smoothing_threshold;
++        }
++        return;
++    }
++    pr_debug("smoothed freq: %lf, new: %lf", *sslope, *slope);
++    *sslope *= s->smoothing_coef;
++    *sslope += (1 - s->smoothing_coef) * *slope;
++//    *dfreq *= (1 - s->dev_coef);
++//    *dfreq += s->dev_coef * fabs(*sfreq - s->clock_freq);
++    *slope = *sslope;
++}
++
+ static void update_size(struct linreg_servo *s)
+ {
+ 	struct result *res;
+@@ -261,6 +292,8 @@
+ 		*state = SERVO_LOCKED;
+ 	}
+ 
++//    smooth_slope(s, &res->slope);
++
+ 	/* Set clock frequency to the slope */
+ 	s->clock_freq = 1e9 * (res->slope - 1.0);
+ 
+@@ -302,6 +335,9 @@
+ 	s->last_update = 0;
+ 	s->size = 0;
+ 	s->frequency_ratio = 1.0;
++    s->smoothed_slope = 0.0;
++    s->smoothing_size = 0;
++    s->dev_freq = 0.0;
+ 
+ 	for (i = MIN_SIZE; i <= MAX_SIZE; i++) {
+ 		s->results[i - MIN_SIZE].slope = 0.0;
+@@ -345,8 +381,15 @@
+ 	s->servo.rate_ratio = linreg_rate_ratio;
+ 	s->servo.leap = linreg_leap;
+ 
++    s->smoothing_threshold = 10;
++    s->smoothing_coef = 0.875;
++    s->dev_coef = 0.25;
++
+ 	s->clock_freq = -fadj;
+ 	s->frequency_ratio = 1.0;
++    s->smoothed_slope = 0.0;
++    s->smoothing_size = 0;
++    s->dev_freq = 0.0;
+ 
+ 	return &s->servo;
+ }
+diff '--color=auto' -ur -x .git linuxptp/makefile wifi-ptp/ptp/makefile
+--- linuxptp/makefile	2024-06-24 23:24:58.513636367 +0800
++++ wifi-ptp/ptp/makefile	2023-06-29 20:22:18.000000000 +0800
+@@ -17,7 +17,7 @@
+ 
+ KBUILD_OUTPUT =
+ 
+-DEBUG	=
++DEBUG	= -g
+ CC	= $(CROSS_COMPILE)gcc
+ VER     = -DVER=$(version)
+ CFLAGS	= -Wall $(VER) $(incdefs) $(DEBUG) $(EXTRA_CFLAGS)
+diff '--color=auto' -ur -x .git linuxptp/port.c wifi-ptp/ptp/port.c
+--- linuxptp/port.c	2024-06-24 23:24:58.523636367 +0800
++++ wifi-ptp/ptp/port.c	2023-06-29 20:22:18.000000000 +0800
+@@ -24,6 +24,9 @@
+ #include <unistd.h>
+ #include <sys/queue.h>
+ #include <net/if.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
+ 
+ #include "bmc.h"
+ #include "clock.h"
+@@ -48,6 +51,17 @@
+ #define ALLOWED_LOST_RESPONSES 3
+ #define ANNOUNCE_SPAN 1
+ 
++#define MAG_SYNC       ((int64_t)189000)
++#define MAG_DREQ       ((int64_t)189000)
++
++static inline uint16_t msg_seq(struct ptp_message *msg) {
++    return msg->header.sequenceId;
++}
++
++static inline int maxi(int a, int b) {
++    return a > b ? a : b;
++}
++
+ enum syfu_event {
+ 	SYNC_MISMATCH,
+ 	SYNC_MATCH,
+@@ -58,6 +72,10 @@
+ static int port_capable(struct port *p);
+ static int port_is_ieee8021as(struct port *p);
+ static void port_nrate_initialize(struct port *p);
++int64_t port_dirty_ts(struct port *p, uint32_t cycle, uint32_t remainder);
++
++static void port_release_burst(struct port *p, struct ptp_message *burst[]);
++static int port_prepare_and_send_batch(struct port *p, struct ptp_message *burst[], int burst_size, enum transport_event event);
+ 
+ static int announce_compare(struct ptp_message *m1, struct ptp_message *m2)
+ {
+@@ -1143,91 +1161,6 @@
+ 	}
+ }
+ 
+-/*
+- * Handle out of order packets. The network stack might
+- * provide the follow up _before_ the sync message. After all,
+- * they can arrive on two different ports. In addition, time
+- * stamping in PHY devices might delay the event packets.
+- */
+-static void port_syfufsm(struct port *p, enum syfu_event event,
+-			 struct ptp_message *m)
+-{
+-	struct ptp_message *syn, *fup;
+-
+-	switch (p->syfu) {
+-	case SF_EMPTY:
+-		switch (event) {
+-		case SYNC_MISMATCH:
+-			msg_get(m);
+-			p->last_syncfup = m;
+-			p->syfu = SF_HAVE_SYNC;
+-			break;
+-		case FUP_MISMATCH:
+-			msg_get(m);
+-			p->last_syncfup = m;
+-			p->syfu = SF_HAVE_FUP;
+-			break;
+-		case SYNC_MATCH:
+-			break;
+-		case FUP_MATCH:
+-			break;
+-		}
+-		break;
+-
+-	case SF_HAVE_SYNC:
+-		switch (event) {
+-		case SYNC_MISMATCH:
+-			msg_put(p->last_syncfup);
+-			msg_get(m);
+-			p->last_syncfup = m;
+-			break;
+-		case SYNC_MATCH:
+-			break;
+-		case FUP_MISMATCH:
+-			msg_put(p->last_syncfup);
+-			msg_get(m);
+-			p->last_syncfup = m;
+-			p->syfu = SF_HAVE_FUP;
+-			break;
+-		case FUP_MATCH:
+-			syn = p->last_syncfup;
+-			port_synchronize(p, syn->hwts.ts, m->ts.pdu,
+-					 syn->header.correction,
+-					 m->header.correction);
+-			msg_put(p->last_syncfup);
+-			p->syfu = SF_EMPTY;
+-			break;
+-		}
+-		break;
+-
+-	case SF_HAVE_FUP:
+-		switch (event) {
+-		case SYNC_MISMATCH:
+-			msg_put(p->last_syncfup);
+-			msg_get(m);
+-			p->last_syncfup = m;
+-			p->syfu = SF_HAVE_SYNC;
+-			break;
+-		case SYNC_MATCH:
+-			fup = p->last_syncfup;
+-			port_synchronize(p, m->hwts.ts, fup->ts.pdu,
+-					 m->header.correction,
+-					 fup->header.correction);
+-			msg_put(p->last_syncfup);
+-			p->syfu = SF_EMPTY;
+-			break;
+-		case FUP_MISMATCH:
+-			msg_put(p->last_syncfup);
+-			msg_get(m);
+-			p->last_syncfup = m;
+-			break;
+-		case FUP_MATCH:
+-			break;
+-		}
+-		break;
+-	}
+-}
+-
+ static int port_pdelay_request(struct port *p)
+ {
+ 	struct ptp_message *msg;
+@@ -1288,7 +1221,18 @@
+ int port_delay_request(struct port *p)
+ {
+ 	struct ptp_message *msg;
++    struct ptp_message *burst[D_BURST_SIZE];
++    int i;
++    int err = 0, len;
++
++    if (p->fixed_delay) {
++        tmv_t pd;
++        pd.ns = p->fixed_delay;
++        clock_path_delay_force(p->clock, pd);
++        return 0;
++    }
+ 
++//    pr_err("sending dreq");
+ 	/* Time to send a new request, forget current pdelay resp and fup */
+ 	if (p->peer_delay_resp) {
+ 		msg_put(p->peer_delay_resp);
+@@ -1303,44 +1247,77 @@
+ 		return port_pdelay_request(p);
+ 	}
+ 
+-	msg = msg_allocate();
+-	if (!msg) {
+-		return -1;
+-	}
++    for (i = 0; i < D_BURST_SIZE; ++i) {
++        msg = msg_allocate();
++        if (!msg) {
++            err = -1;
++            goto out;
++        }
++        burst[i] = msg;
++    }
++
++    for (i = 0; i < D_BURST_SIZE; ++i) {
++        msg = burst[i];
++
++        msg->hwts.type = p->timestamping;
++
++        msg->header.tsmt               = DELAY_REQ | p->transportSpecific;
++        msg->header.ver                = PTP_VERSION;
++        msg->header.messageLength      = sizeof(struct delay_req_msg);
++        msg->header.domainNumber       = clock_domain_number(p->clock);
++        msg->header.correction         = -p->asymmetry;
++        msg->header.sourcePortIdentity = p->portIdentity;
++        msg->header.sequenceId         = p->seqnum.delayreq++;
++        msg->header.control            = CTL_DELAY_REQ;
++        msg->header.logMessageInterval = 0x7f;
++
++        if (p->hybrid_e2e) {
++            struct ptp_message *dst = TAILQ_FIRST(&p->best->messages);
++            msg->address = dst->address;
++            msg->header.flagField[0] |= UNICAST;
++        }
++    }
++
++    if (port_prepare_and_send_batch(p, burst, D_BURST_SIZE, TRANS_DEFER_EVENT)) {
++        pr_err("port %hu: send delay request failed", portnum(p));
++        i = D_BURST_SIZE;
++        goto out;
++    }
++    pr_debug("port %hu: delay request sent", portnum(p));
++
++    for (i = 0; i < D_BURST_SIZE; ++i) {
++        msg = burst[i];
++        if (msg_sots_missing(msg)) {
++            pr_err("missing timestamp on transmitted delay request");
++            i = D_BURST_SIZE;
++            goto out;
++        }
++    }
++
++    pr_debug("port %hu: tx delay is calling interpolate", portnum(p));
++    len = port_burst_interpolate(p, burst, maxi(1, D_BURST_SIZE - 1), MAG_DREQ, 1);
++    if (!len) {
++        pr_err("port %hu: tx delay request interpolate failed", portnum(p));
++        i = D_BURST_SIZE;
++        goto out;
++    }
++
++    for (i = 0; i < len; ++i) {
++        TAILQ_INSERT_HEAD(&p->delay_req, burst[i], list);
++    }
++    for (i = len; i < D_BURST_SIZE; ++i) {
++        msg_put(burst[i]);
++    }
+ 
+-	msg->hwts.type = p->timestamping;
+-
+-	msg->header.tsmt               = DELAY_REQ | p->transportSpecific;
+-	msg->header.ver                = PTP_VERSION;
+-	msg->header.messageLength      = sizeof(struct delay_req_msg);
+-	msg->header.domainNumber       = clock_domain_number(p->clock);
+-	msg->header.correction         = -p->asymmetry;
+-	msg->header.sourcePortIdentity = p->portIdentity;
+-	msg->header.sequenceId         = p->seqnum.delayreq++;
+-	msg->header.control            = CTL_DELAY_REQ;
+-	msg->header.logMessageInterval = 0x7f;
+-
+-	if (p->hybrid_e2e) {
+-		struct ptp_message *dst = TAILQ_FIRST(&p->best->messages);
+-		msg->address = dst->address;
+-		msg->header.flagField[0] |= UNICAST;
+-	}
+-
+-	if (port_prepare_and_send(p, msg, TRANS_EVENT)) {
+-		pr_err("port %hu: send delay request failed", portnum(p));
+-		goto out;
+-	}
+-	if (msg_sots_missing(msg)) {
+-		pr_err("missing timestamp on transmitted delay request");
+-		goto out;
+-	}
+-
+-	TAILQ_INSERT_HEAD(&p->delay_req, msg, list);
++    p->delay_updated = 0;
+ 
+ 	return 0;
+ out:
+-	msg_put(msg);
+-	return -1;
++    while (i - 1 >= 0) {
++        msg_put(burst[i - 1]);
++        --i;
++    }
++	return err;
+ }
+ 
+ int port_tx_announce(struct port *p, struct address *dst)
+@@ -1401,23 +1378,9 @@
+ int port_tx_sync(struct port *p, struct address *dst)
+ {
+ 	struct ptp_message *msg, *fup;
+-	int err, event;
+-
+-	switch (p->timestamping) {
+-	case TS_SOFTWARE:
+-	case TS_LEGACY_HW:
+-	case TS_HARDWARE:
+-		event = TRANS_EVENT;
+-		break;
+-	case TS_ONESTEP:
+-		event = TRANS_ONESTEP;
+-		break;
+-	case TS_P2P1STEP:
+-		event = TRANS_P2P1STEP;
+-		break;
+-	default:
+-		return -1;
+-	}
++	struct ptp_message *burst[S_BURST_SIZE];
++	int err, i;
++    int len;
+ 
+ 	if (p->inhibit_multicast_service && !dst) {
+ 		return 0;
+@@ -1428,82 +1391,108 @@
+ 	if (port_sync_incapable(p)) {
+ 		return 0;
+ 	}
+-	msg = msg_allocate();
+-	if (!msg) {
+-		return -1;
+-	}
++
+ 	fup = msg_allocate();
+ 	if (!fup) {
+-		msg_put(msg);
+ 		return -1;
+ 	}
+ 
+-	msg->hwts.type = p->timestamping;
+-
+-	msg->header.tsmt               = SYNC | p->transportSpecific;
+-	msg->header.ver                = PTP_VERSION;
+-	msg->header.messageLength      = sizeof(struct sync_msg);
+-	msg->header.domainNumber       = clock_domain_number(p->clock);
+-	msg->header.sourcePortIdentity = p->portIdentity;
+-	msg->header.sequenceId         = p->seqnum.sync++;
+-	msg->header.control            = CTL_SYNC;
+-	msg->header.logMessageInterval = p->logSyncInterval;
+-
+-	if (p->timestamping != TS_ONESTEP && p->timestamping != TS_P2P1STEP) {
+-		msg->header.flagField[0] |= TWO_STEP;
+-	}
+-
+-	if (dst) {
+-		msg->address = *dst;
+-		msg->header.flagField[0] |= UNICAST;
+-		msg->header.logMessageInterval = 0x7f;
+-	}
+-	err = port_prepare_and_send(p, msg, event);
+-	if (err) {
+-		pr_err("port %hu: send sync failed", portnum(p));
+-		goto out;
+-	}
+-	if (p->timestamping == TS_ONESTEP || p->timestamping == TS_P2P1STEP) {
+-		goto out;
+-	} else if (msg_sots_missing(msg)) {
+-		pr_err("missing timestamp on transmitted sync");
+-		err = -1;
+-		goto out;
+-	}
++    for (i = 0; i < S_BURST_SIZE; ++i) {
++        msg = msg_allocate();
++        if (!msg) {
++            pr_crit("oom!!!!!!!!!!!!!!!!!!!!!!!! %s:%d", __FUNCTION__, __LINE__);
++            return -1;
++        }
++        burst[i] = msg;
++    }
++
++    for (i = 0; i < S_BURST_SIZE; ++i) {
++        msg = burst[i];
++        msg->hwts.type = p->timestamping;
++
++        msg->header.tsmt               = SYNC | p->transportSpecific;
++        msg->header.ver                = PTP_VERSION;
++        msg->header.messageLength      = sizeof(struct sync_msg);
++        msg->header.domainNumber       = clock_domain_number(p->clock);
++        msg->header.sourcePortIdentity = p->portIdentity;
++        msg->header.sequenceId         = p->seqnum.sync++;
++        msg->header.control            = CTL_SYNC;
++        msg->header.logMessageInterval = p->logSyncInterval;
++
++        if (p->timestamping != TS_ONESTEP && p->timestamping != TS_P2P1STEP) {
++            msg->header.flagField[0] |= TWO_STEP;
++        }
++
++        if (dst) {
++            msg->address = *dst;
++            msg->header.flagField[0] |= UNICAST;
++            msg->header.logMessageInterval = 0x7f;
++        }
++    }
++
++    err = port_prepare_and_send_batch(p, burst, S_BURST_SIZE, TRANS_DEFER_EVENT);
++    if (err) {
++        pr_err("port %hu: send sync failed", portnum(p));
++        goto out;
++    }
++
++    for (i = 0; i < S_BURST_SIZE; ++i) {
++        if (p->timestamping == TS_ONESTEP || p->timestamping == TS_P2P1STEP) {
++            goto out;
++        } else if (msg_sots_missing(msg)) {
++            pr_err("missing timestamp on transmitted sync");
++            err = 0;
++            goto out;
++        }
++    }
++
++    pr_debug("port %hu: tx sync is calling interpolate", portnum(p));
++    len = port_burst_interpolate(p, burst, maxi(1, S_BURST_SIZE - 1), MAG_SYNC, 1);
++    if (!len) {
++        pr_err("port %hu: tx sync interpolate failed", portnum(p));
++        err = 0;
++        goto out;
++    }
+ 
+ 	/*
+ 	 * Send the follow up message right away.
+ 	 */
+-	fup->hwts.type = p->timestamping;
++    for (i = 0; i < len; ++i) {
++        msg = burst[i];
++        fup->hwts.type = p->timestamping;
++
++        fup->header.tsmt               = FOLLOW_UP | p->transportSpecific;
++        fup->header.ver                = PTP_VERSION;
++        fup->header.messageLength      = sizeof(struct follow_up_msg);
++        fup->header.domainNumber       = clock_domain_number(p->clock);
++        fup->header.sourcePortIdentity = p->portIdentity;
++        fup->header.sequenceId         = ntohs(msg_seq(msg));
++        fup->header.control            = CTL_FOLLOW_UP;
++        fup->header.logMessageInterval = p->logSyncInterval;
++
++        fup->follow_up.preciseOriginTimestamp = tmv_to_Timestamp(msg->hwts.ts);
++
++        if (dst) {
++            fup->address = *dst;
++            fup->header.flagField[0] |= UNICAST;
++        }
++        if (p->follow_up_info && follow_up_info_append(fup)) {
++            pr_err("port %hu: append fup info failed", portnum(p));
++            err = -1;
++            goto out;
++        }
++
++        err = port_prepare_and_send(p, fup, TRANS_GENERAL);
++        if (err) {
++            pr_err("port %hu: send follow up failed", portnum(p));
++        }
++    }
+ 
+-	fup->header.tsmt               = FOLLOW_UP | p->transportSpecific;
+-	fup->header.ver                = PTP_VERSION;
+-	fup->header.messageLength      = sizeof(struct follow_up_msg);
+-	fup->header.domainNumber       = clock_domain_number(p->clock);
+-	fup->header.sourcePortIdentity = p->portIdentity;
+-	fup->header.sequenceId         = p->seqnum.sync - 1;
+-	fup->header.control            = CTL_FOLLOW_UP;
+-	fup->header.logMessageInterval = p->logSyncInterval;
+-
+-	fup->follow_up.preciseOriginTimestamp = tmv_to_Timestamp(msg->hwts.ts);
+-
+-	if (dst) {
+-		fup->address = *dst;
+-		fup->header.flagField[0] |= UNICAST;
+-	}
+-	if (p->follow_up_info && follow_up_info_append(fup)) {
+-		pr_err("port %hu: append fup info failed", portnum(p));
+-		err = -1;
+-		goto out;
+-	}
+-
+-	err = port_prepare_and_send(p, fup, TRANS_GENERAL);
+-	if (err) {
+-		pr_err("port %hu: send follow up failed", portnum(p));
+-	}
+ out:
+-	msg_put(msg);
+-	msg_put(fup);
++    msg_put(fup);
++    for(i = 0; i < S_BURST_SIZE; ++i) {
++        msg_put(burst[i]);
++    }
+ 	return err;
+ }
+ 
+@@ -1772,7 +1761,8 @@
+ 
+ static int process_delay_req(struct port *p, struct ptp_message *m)
+ {
+-	int err, nsm, saved_seqnum_sync;
++	int err, nsm, i;
++    int len;
+ 	struct ptp_message *msg;
+ 
+ 	nsm = port_nsm_reply(p, m);
+@@ -1786,50 +1776,74 @@
+ 		return 0;
+ 	}
+ 
+-	msg = msg_allocate();
+-	if (!msg) {
+-		return -1;
+-	}
+-
+-	msg->hwts.type = p->timestamping;
+-
+-	msg->header.tsmt               = DELAY_RESP | p->transportSpecific;
+-	msg->header.ver                = PTP_VERSION;
+-	msg->header.messageLength      = sizeof(struct delay_resp_msg);
+-	msg->header.domainNumber       = m->header.domainNumber;
+-	msg->header.correction         = m->header.correction;
+-	msg->header.sourcePortIdentity = p->portIdentity;
+-	msg->header.sequenceId         = m->header.sequenceId;
+-	msg->header.control            = CTL_DELAY_RESP;
+-	msg->header.logMessageInterval = p->logMinDelayReqInterval;
+-
+-	msg->delay_resp.receiveTimestamp = tmv_to_Timestamp(m->hwts.ts);
+-
+-	msg->delay_resp.requestingPortIdentity = m->header.sourcePortIdentity;
+-
+-	if (p->hybrid_e2e && msg_unicast(m)) {
+-		msg->address = m->address;
+-		msg->header.flagField[0] |= UNICAST;
+-		msg->header.logMessageInterval = 0x7f;
+-	}
+-	if (nsm && net_sync_resp_append(p, msg)) {
+-		pr_err("port %hu: append NSM failed", portnum(p));
+-		err = -1;
+-		goto out;
+-	}
+-	err = port_prepare_and_send(p, msg, TRANS_GENERAL);
+-	if (err) {
+-		pr_err("port %hu: send delay response failed", portnum(p));
+-		goto out;
+-	}
+-	if (nsm) {
+-		saved_seqnum_sync = p->seqnum.sync;
+-		p->seqnum.sync = m->header.sequenceId;
+-		err = port_tx_sync(p, &m->address);
+-		p->seqnum.sync = saved_seqnum_sync;
+-	}
++    if (!port_burst_insert(p, p->delayreq_burst, D_BURST_SIZE, m)) {
++        pr_err("port %hu: delay request insert failed", portnum(p));
++        return 0;
++    }
++    if ((msg_seq(m) + 1) % D_BURST_SIZE != 0) {
++        return 0;
++    }
++
++    pr_debug("port %hu: rx delay is calling interpolate", portnum(p));
++    len = port_burst_interpolate(p, p->delayreq_burst, maxi(1, p->drq_idx - 1), MAG_DREQ, 0);
++    if (!len) {
++        pr_err("port %hu: rx delay request interpolate failed", portnum(p));
++        port_release_burst(p, p->delayreq_burst);
++        return 0;
++    }
++
++    msg = msg_allocate();
++    if (!msg) {
++        return -1;
++    }
++    for (i = 0; i < len; ++i) {
++        m = p->delayreq_burst[i];
++
++        msg->hwts.type = p->timestamping;
++
++        msg->header.tsmt               = DELAY_RESP | p->transportSpecific;
++        msg->header.ver                = PTP_VERSION;
++        msg->header.messageLength      = sizeof(struct delay_resp_msg);
++        msg->header.domainNumber       = m->header.domainNumber;
++        msg->header.correction         = m->header.correction;
++        msg->header.sourcePortIdentity = p->portIdentity;
++        msg->header.sequenceId         = m->header.sequenceId;
++        msg->header.control            = CTL_DELAY_RESP;
++        msg->header.logMessageInterval = p->logMinDelayReqInterval;
++
++        msg->delay_resp.receiveTimestamp = tmv_to_Timestamp(m->hwts.ts);
++
++        msg->delay_resp.requestingPortIdentity = m->header.sourcePortIdentity;
++
++        if (p->hybrid_e2e && msg_unicast(m)) {
++            msg->address = m->address;
++            msg->header.flagField[0] |= UNICAST;
++            msg->header.logMessageInterval = 0x7f;
++        }
++        if (nsm && net_sync_resp_append(p, msg)) {
++            pr_err("port %hu: append NSM failed", portnum(p));
++            err = -1;
++            msg_put(msg);
++            goto out;
++        }
++        err = port_prepare_and_send(p, msg, TRANS_GENERAL);
++        if (err) {
++            pr_err("port %hu: send delay response failed", portnum(p));
++            msg_put(msg);
++            goto out;
++        }
++        /*
++        if (nsm) {
++            saved_seqnum_sync = p->seqnum.sync;
++            p->seqnum.sync = m->header.sequenceId;
++            err = port_tx_sync(p, &m->address);
++            p->seqnum.sync = saved_seqnum_sync;
++        }
++        */
++    }
++    msg_put(msg);
+ out:
+-	msg_put(msg);
++    port_release_burst(p, p->delayreq_burst);
+ 	return err;
+ }
+ 
+@@ -1856,39 +1870,47 @@
+ 	if (!req) {
+ 		return;
+ 	}
++    if (msg_sots_missing(req)) {
++        return;
++    }
++
++    if (!p->delay_updated) {
++        c3 = correction_to_tmv(m->header.correction);
++        t3 = req->hwts.ts;
++        t4 = timestamp_to_tmv(m->ts.pdu);
++        t4c = tmv_sub(t4, c3);
+ 
+-	c3 = correction_to_tmv(m->header.correction);
+-	t3 = req->hwts.ts;
+-	t4 = timestamp_to_tmv(m->ts.pdu);
+-	t4c = tmv_sub(t4, c3);
+-
+-	clock_path_delay(p->clock, t3, t4c);
++        clock_path_delay(p->clock, t3, t4c);
++    }
+ 
+ 	TAILQ_REMOVE(&p->delay_req, req, list);
+ 	msg_put(req);
+ 
+-	if (p->logMinDelayReqInterval == rsp->hdr.logMessageInterval) {
+-		return;
+-	}
+-	if (msg_unicast(m)) {
+-		/* Unicast responses have logMinDelayReqInterval set to 0x7F. */
+-		return;
+-	}
+-	if (rsp->hdr.logMessageInterval < -10 ||
+-	    rsp->hdr.logMessageInterval > 22) {
+-		pl_info(300, "port %hu: ignore bogus delay request interval 2^%d",
+-			portnum(p), rsp->hdr.logMessageInterval);
+-		return;
+-	}
+-	p->logMinDelayReqInterval = rsp->hdr.logMessageInterval;
+-	pr_notice("port %hu: minimum delay request interval 2^%d",
+-		  portnum(p), p->logMinDelayReqInterval);
+-	port_set_delay_tmo(p);
++    if (!p->delay_updated) {
++        p->delay_updated = 1;
++        if (p->logMinDelayReqInterval == rsp->hdr.logMessageInterval) {
++            return;
++        }
++        if (msg_unicast(m)) {
++            /* Unicast responses have logMinDelayReqInterval set to 0x7F. */
++            return;
++        }
++        if (rsp->hdr.logMessageInterval < -10 ||
++            rsp->hdr.logMessageInterval > 22) {
++            pl_info(300, "port %hu: ignore bogus delay request interval 2^%d",
++                portnum(p), rsp->hdr.logMessageInterval);
++            return;
++        }
++        p->logMinDelayReqInterval = rsp->hdr.logMessageInterval;
++        pr_notice("port %hu: minimum delay request interval 2^%d",
++              portnum(p), p->logMinDelayReqInterval);
++        port_set_delay_tmo(p);
++    }
+ }
+ 
+ void process_follow_up(struct port *p, struct ptp_message *m)
+ {
+-	enum syfu_event event;
++    struct ptp_message *fup = NULL, *syn;
+ 	switch (p->state) {
+ 	case PS_INITIALIZING:
+ 	case PS_FAULTY:
+@@ -1915,13 +1937,32 @@
+ 		clock_follow_up_info(p->clock, fui);
+ 	}
+ 
+-	if (p->syfu == SF_HAVE_SYNC &&
+-	    p->last_syncfup->header.sequenceId == m->header.sequenceId) {
+-		event = FUP_MATCH;
+-	} else {
+-		event = FUP_MISMATCH;
+-	}
+-	port_syfufsm(p, event, m);
++    if (!m->ts.pdu.sec && !m->ts.pdu.nsec) {
++        return;
++    }
++
++    pr_debug("port %hu: processing fup", portnum(p));
++    fup = m;
++    port_pick_syncfup(p, &syn, &fup);
++    if (!syn || !fup) {
++        pr_err("didn't find matched sync/fup pair %u", msg_seq(m));
++        goto out;
++    }
++    if (!p->sync_updated) {
++        pr_err("picked ts: %" PRIu64 ", %ld",
++                (uint64_t)(fup->ts.pdu.sec * 1000000000LL + fup->ts.pdu.nsec),
++                syn->hwts.ts.ns);
++        port_synchronize(p, syn->hwts.ts, fup->ts.pdu,
++                 syn->header.correction,
++                 fup->header.correction);
++        p->sync_updated = 1;
++    }
++
++    TAILQ_REMOVE(&p->sync_lst, syn, list);
++    msg_put(syn);
++
++out:
++    return;
+ }
+ 
+ int process_pdelay_req(struct port *p, struct ptp_message *m)
+@@ -2192,7 +2233,7 @@
+ 
+ void process_sync(struct port *p, struct ptp_message *m)
+ {
+-	enum syfu_event event;
++    int len, i;
+ 	switch (p->state) {
+ 	case PS_INITIALIZING:
+ 	case PS_FAULTY:
+@@ -2227,14 +2268,33 @@
+ 		return;
+ 	}
+ 
+-	if (p->syfu == SF_HAVE_FUP &&
+-	    fup_sync_ok(p->last_syncfup, m) &&
+-	    p->last_syncfup->header.sequenceId == m->header.sequenceId) {
+-		event = SYNC_MATCH;
+-	} else {
+-		event = SYNC_MISMATCH;
+-	}
+-	port_syfufsm(p, event, m);
++    if (!port_burst_insert(p, p->sync_burst, S_BURST_SIZE, m)) {
++        pr_err("port %hu: sync insert failed", portnum(p));
++        return;
++    }
++
++    if ((msg_seq(m) + 1) % S_BURST_SIZE != 0) {
++        p->sync_updated = 0;
++        return;
++    }
++    if (S_BURST_SIZE == 1) {
++        p->sync_updated = 0;
++    }
++
++    pr_debug("port %hu: rx sync is calling interpolate", portnum(p));
++    len = port_burst_interpolate(p, p->sync_burst, maxi(1, p->sb_idx - 1), MAG_SYNC, 0);
++    if (!len) {
++        pr_warning("port %hu: rx sync interpolate failed", portnum(p));
++        port_release_burst(p, p->sync_burst);
++        p->sync_updated = 0;
++        return;
++    }
++
++    for (i = 0; i < len; ++i) {
++        msg_get(p->sync_burst[i]);
++        TAILQ_INSERT_HEAD(&p->sync_lst, p->sync_burst[i], list);
++    }
++    port_release_burst(p, p->sync_burst);
+ }
+ 
+ /* public methods */
+@@ -2480,6 +2540,7 @@
+ 	enum fsm_event event = EV_NONE;
+ 	struct ptp_message *msg;
+ 	int cnt, fd = p->fda.fd[fd_index], err;
++    struct address *peer_addr = NULL;
+ 
+ 	switch (fd_index) {
+ 	case FD_ANNOUNCE_TIMER:
+@@ -2517,7 +2578,7 @@
+ 		return EV_ANNOUNCE_RECEIPT_TIMEOUT_EXPIRES;
+ 
+ 	case FD_DELAY_TIMER:
+-		pr_debug("port %hu: delay timeout", portnum(p));
++		pr_debug("port %hu: delay timeout port.c", portnum(p));
+ 		port_set_delay_tmo(p);
+ 		delay_req_prune(p);
+ 		return port_delay_request(p) ? EV_FAULT_DETECTED : EV_NONE;
+@@ -2534,7 +2595,10 @@
+ 	case FD_SYNC_TX_TIMER:
+ 		pr_debug("port %hu: master sync timeout", portnum(p));
+ 		port_set_sync_tx_tmo(p);
+-		return port_tx_sync(p, NULL) ? EV_FAULT_DETECTED : EV_NONE;
++        if (p->slave_address.len) {
++            peer_addr = &p->slave_address;
++        }
++		return port_tx_sync(p, peer_addr) ? EV_FAULT_DETECTED : EV_NONE;
+ 
+ 	case FD_UNICAST_SRV_TIMER:
+ 		pr_debug("port %hu: unicast service timeout", portnum(p));
+@@ -2873,6 +2937,7 @@
+ 	struct port *p = malloc(sizeof(*p));
+ 	enum transport_type transport;
+ 	int i;
++    char *paddr;
+ 
+ 	if (!p) {
+ 		return NULL;
+@@ -2918,6 +2983,7 @@
+ 		p->state_machine = clock_slave_only(clock) ? ptp_slave_fsm : ptp_fsm;
+ 	}
+ 
++    interface->ts_info.phc_index = phc_index; //dirty work
+ 	if (transport == TRANS_UDS) {
+ 		; /* UDS cannot have a PHC. */
+ 	} else if (!interface->ts_info.valid) {
+@@ -3018,6 +3084,24 @@
+ 			goto err_tsproc;
+ 		}
+ 	}
++
++    TAILQ_INIT(&p->sync_lst);
++
++    paddr = config_get_string(cfg, p->name, "slave_unicast");
++    p->slave_address.len = 0;
++    if (strlen(paddr)) {
++        if (inet_pton(AF_INET, paddr, &p->slave_address.sin.sin_addr) == 1) {
++            p->slave_address.len = sizeof(p->slave_address.sin);
++        } else {
++            pr_err("invalid slave address: %s", paddr);
++        }
++    }
++    p->fixed_delay = config_get_int(cfg, p->name, "fixed_delay");
++
++    if (strlen(interface->ts_label)) {
++        p->phyno = extract_phyno(interface->name);
++    }
++
+ 	return p;
+ 
+ err_tsproc:
+@@ -3079,3 +3163,356 @@
+ {
+ 	return p->bmca;
+ }
++
++static inline int *burst_get_index(struct port *p, struct ptp_message *burst[]) {
++    int *idx = NULL;
++    if (burst == p->sync_burst) {
++        idx = &p->sb_idx;
++    } else if (burst == p->delayreq_burst) {
++        idx = &p->drq_idx;
++    }
++    return idx;
++}
++
++static int64_t msg_tsns(struct ptp_message *msg) {
++    return msg->hwts.ts.ns;
++}
++
++int port_burst_insert(struct port *p, struct ptp_message *burst[], int burst_size, struct ptp_message *msg) {
++    int i;
++    int *idx;
++
++    idx = burst_get_index(p, burst);
++    if (!idx) {
++        return 0;
++    }
++
++    if (*idx == burst_size) {
++        if (msg_tsns(msg) < msg_tsns(burst[0])) {
++            return 1;
++        } else {
++            port_release_burst(p, burst);
++        }
++    }
++    i = *idx;
++    while (i > 0) {
++        if (msg_tsns(msg) > msg_tsns(burst[i - 1])) {
++            break;
++        }
++        burst[i] = burst[i - 1];
++        --i;
++    }
++//    pr_warning("insert %p at %d in %p", msg, i, burst);
++    msg_get(msg);
++    burst[i] = msg;
++    *idx += 1;
++
++    return 1;
++}
++
++static void port_release_burst(struct port *p, struct ptp_message *burst[]) {
++    int i, *idx;
++    idx = burst_get_index(p, burst);
++
++    for (i = 0; i < *idx; ++i) {
++        msg_put(burst[i]);
++        burst[i] = 0;
++    }
++    *idx = 0;
++}
++
++void port_pick_syncfup(struct port *p, struct ptp_message **sync, struct ptp_message **fup) {
++    struct ptp_message *syn = NULL;
++
++    TAILQ_FOREACH(syn, &p->sync_lst, list) {
++        if (msg_seq(*fup) == msg_seq(syn)) {
++            break;
++        }
++    }
++    if (syn == NULL) {
++        if (p->last_fup) {
++            TAILQ_FOREACH(syn, &p->sync_lst, list) {
++                if (msg_seq(p->last_fup) == msg_seq(syn)) {
++                    break;
++                }
++            }
++        }
++        msg_get(*fup);
++        struct ptp_message *m = *fup;
++        *fup = p->last_fup;
++        p->last_fup = m;
++    }
++    *sync = syn;
++}
++
++int64_t port_dirty_ts(struct port *p, uint32_t cycle, uint32_t remainder) {
++    int64_t ns;
++    uint64_t dirtyts;
++    char dbgfs_path[256];
++    int fd;
++
++    snprintf(dbgfs_path, sizeof dbgfs_path, "/sys/kernel/debug/ieee80211/phy%d/ath9k/dirtyts", p->phyno);
++    fd = open(dbgfs_path, O_RDWR);
++    if (fd < 0) {
++        abort();
++    }
++
++    dirtyts = cycle;
++    dirtyts <<= 32;
++    dirtyts |= remainder;
++
++    write(fd, &dirtyts, sizeof dirtyts);
++    lseek(fd, 0, SEEK_SET);
++    read(fd, &ns, sizeof ns);
++
++    close(fd);
++
++    return ns;
++}
++
++static inline int64_t absi64(int64_t n) {
++    return (n >= 0 ? n : -n);
++}
++
++void find_longest_cons_seq(struct ptp_message *burst[], int burst_size, int pidx[2], int64_t interns, int tx) {
++    struct {
++        int start;
++        int len;
++    } curr, longest;
++    int i;
++    int64_t last, slast;
++
++    pidx[0] = pidx[1] = -1;
++    longest.len = 0;
++    curr.start = longest.start = 0;
++    curr.len = longest.len = 1;
++    last = msg_tsns(burst[0]);
++    slast = msg_seq(burst[0]);
++    for (i = 1; i < burst_size; ++i) {
++        int64_t sdiff = msg_seq(burst[i]) - slast;
++        int64_t diff = msg_tsns(burst[i]) - last - interns * sdiff;
++        int reset = 1;
++        if (diff == 0) {
++            curr.len += 1;
++            reset = 0;
++        } else if (absi64(diff) <= 2000 * sdiff) {
++            curr.len += 1;
++        //    pr_err("potential precison point: diff %ld at idx %d, sdiff %ld", diff, i, sdiff);
++        } else {
++        //    pr_err("unexpected: diff %ld at idx %d, sdiff %ld", diff, i, sdiff);
++        }
++        if (longest.len < curr.len) {
++            longest = curr;
++        } else if (longest.len == curr.len) {
++            if (longest.start < curr.start) {
++                longest = curr;
++            }
++        }
++        if (reset) {
++            curr.start = i;
++            curr.len = 1;
++        }
++        last = msg_tsns(burst[i]);
++        slast = msg_seq(burst[i]);
++    }
++    pidx[0] = longest.start;
++    pidx[1] = pidx[0] + longest.len - 1;
++    pr_warning("precision idx: %d -> %d, seq %d -> %d, start %d, burst idx %d",
++                pidx[0], pidx[1],
++                msg_seq(burst[pidx[0]]),
++                msg_seq(burst[pidx[1]]),
++                msg_seq(burst[0]),
++                msg_seq(burst[0]) / burst_size);
++    if (!tx) {
++        for (i = 0; i < burst_size; ++i) {
++            fprintf(stderr, "%ld, ", (msg_tsns(burst[i]) / 1000) % 10000);
++        }
++        fputs("\n", stderr);
++    }
++
++}
++
++int port_burst_lsm(struct port *p, struct ptp_message *burst[], int burst_size, int endian) {
++    int i;
++    int64_t xy, xsum, ysum, xx;
++    int64_t xbase, ybase;
++    double xbar, ybar, Dy, Dx;
++    double slope, intercept;
++    double maxd = 0.0;
++
++    if (burst_size == 1) {
++        burst[0]->hwts.ts.ns = port_dirty_ts(p, burst[0]->hwts.ts.ns / 1000, 0);
++        return 1;
++    }
++
++    if (endian) {
++        for (i = 0; i < burst_size; ++i) {
++            burst[i]->header.sequenceId = ntohs(msg_seq(burst[i]));
++        }
++    }
++
++    xy = xsum = ysum = xx = 0;
++    xbase = msg_seq(burst[0]);
++    ybase = msg_tsns(burst[0]);
++
++    for (i = 0; i < burst_size; ++i) {
++        int64_t x = msg_seq(burst[i]) - xbase;
++        int64_t y = msg_tsns(burst[i]) - ybase;
++        xy   += x * y;
++        xsum += x;
++        ysum += y;
++        xx   += x * x;
++    }
++
++    xbar = ((double)xsum) / burst_size;
++    ybar = ((double)ysum) / burst_size;
++
++    Dy = (double)xy - xbar * ybar * burst_size;
++    Dx = (double)xx - xbar * xbar * burst_size;
++//    fprintf(stderr, "xy = %ld, xsum = %ld, ysum = %ld, xx = %ld, Dy = %lf, Dx = %lf\n",
++//                           xy,       xsum,       ysum,       xx,       Dy,       Dx);
++
++    slope = Dy / Dx;
++    intercept = ybar - slope * xbar;
++
++//    pr_warning("slope = %lf, intercept = %lf", slope, intercept);
++
++    for (i = 0; i < burst_size; ++i) {
++        int64_t x = msg_seq(burst[i]) - xbase;
++        double dy = (msg_tsns(burst[i]) - ybase) - (slope * x + intercept);
++        if (dy > maxd) {
++            maxd = dy;
++        }
++    }
++
++//    intercept += maxd;
++//        fprintf(stderr, "{ %ld, %ld, %ld },", x, y + ybase, y + ybase - msg_tsns(burst[i]));
++    for (i = 0; i < burst_size; ++i) {
++        int64_t x = msg_seq(burst[i]) - xbase;
++        int64_t y = slope * x + intercept;
++        burst[i]->hwts.ts.ns = port_dirty_ts(p, (y + ybase) / 1000, (y + ybase) % 1000);
++    }
++//    fputs("\n", stderr);
++
++    if (endian) {
++        for (i = 0; i < burst_size; ++i) {
++            burst[i]->header.sequenceId = htons(msg_seq(burst[i]));
++        }
++    }
++
++    return burst_size;
++}
++
++int port_burst_interpolate(struct port *p, struct ptp_message *burst[], int burst_size, int64_t interns, int endian) {
++    int i, j = 2, interlen;
++    int pidx[2];
++    int64_t interval;
++    int64_t left, right;
++    struct ptp_message *tbuf[64];
++
++    return port_burst_lsm(p, burst, burst_size, endian);
++    if (burst_size == 1) {
++        burst[0]->hwts.ts.ns = port_dirty_ts(p, burst[0]->hwts.ts.ns / 1000, 0);
++        return 1;
++    }
++
++    /*
++    for (i = burst_size - 1; i >= 0; --i) {
++        burst[i]->hwts.ts.ns = port_dirty_ts(p, burst[i]->hwts.ts.ns / 1000);
++    }
++    return burst_size;
++    */
++
++    if (endian) {
++        for (i = 0; i < burst_size; ++i) {
++            burst[i]->header.sequenceId = ntohs(msg_seq(burst[i]));
++        }
++    }
++
++    find_longest_cons_seq(burst, burst_size, pidx, interns, endian);
++
++    interlen = msg_seq(burst[pidx[1]]) - msg_seq(burst[pidx[0]]);
++    left  = port_dirty_ts(p, msg_tsns(burst[pidx[0]]) / 1000, 0);
++    right = port_dirty_ts(p, msg_tsns(burst[pidx[1]]) / 1000, 0);
++    if (interlen < 2) {
++        pr_warning("interlen too small");
++    }
++    interval = interlen ? (right - left) / interlen : 0;
++
++    j = 0;
++    for (i = pidx[0]; i <= pidx[1]; ++i) {
++        burst[i]->hwts.ts.ns = left + (msg_seq(burst[i]) - msg_seq(burst[pidx[0]])) * interval;
++        tbuf[j++] = burst[i];
++    }
++
++    for (i = pidx[0] - 1, j = pidx[1]; i >= 0; --i, --j) {
++        burst[j] = burst[i];
++    }
++    for (i = 0; i <= interlen; ++i) {
++        burst[i] = tbuf[i];
++    }
++    for (i = interlen + 1; i < burst_size; ++i) {
++        burst[i]->hwts.ts.ns = port_dirty_ts(p, msg_tsns(burst[i]) / 1000, 0);
++    }
++
++    if (endian) {
++        for (i = 0; i < burst_size; ++i) {
++            burst[i]->header.sequenceId = htons(msg_seq(burst[i]));
++        }
++    }
++
++    /*
++    pr_warning("precision idx: %d -> %d, %ld -> %ld",
++            pidx[0], pidx[1],
++            burst[pidx[0]]->hwts.ts.ns / 1000,
++            burst[pidx[1]]->hwts.ts.ns / 1000);
++            */
++
++//    pr_err("burst[p0] = %ld", burst[pidx[0]]->hwts.ts.ns);
++//    pr_err("burst[p1] = %ld", burst[pidx[1]]->hwts.ts.ns);
++    return pidx[1] - pidx[0] + 1;
++}
++
++static int port_prepare_and_send_batch(struct port *p, struct ptp_message *burst[], int burst_size, enum transport_event event) {
++    int cnt, i;
++    char path[256];
++    char cmd[2048];
++
++    snprintf(path, sizeof path, "/sys/kernel/debug/ieee80211/phy%d/ath9k/trigger_cbr", p->phyno);
++
++    for (i = 0; i < burst_size; ++i) {
++        if (msg_pre_send(burst[i])) {
++            return -1;
++        }
++    }
++
++    if (burst_size > 1) {
++        snprintf(cmd, sizeof cmd, "echo -n cc > %s", path);
++        system(cmd);
++    }
++    for (i = 0; i < burst_size; ++i) {
++        if (msg_unicast(burst[i])) {
++            cnt = transport_sendto(p->trp, &p->fda, event, burst[i]);
++        } else {
++            cnt = transport_send(p->trp, &p->fda, event, burst[i]);
++        }
++
++        if (cnt <= 0) {
++            pr_err("port %hu: send_batch failed", portnum(p));
++            return -1;
++        }
++    }
++    if (burst_size > 1) {
++        snprintf(cmd, sizeof cmd, "echo -n c > %s", path);
++        system(cmd);
++    }
++
++    for (i = 0; i < burst_size; ++i) {
++        if (transport_txts(&p->fda, burst[i])) {
++            pr_err("port %hu: batch get txts failed", portnum(p));
++            return -1;
++        }
++    }
++    return 0;
++}
++
+diff '--color=auto' -ur -x .git linuxptp/port_private.h wifi-ptp/ptp/port_private.h
+--- linuxptp/port_private.h	2024-06-24 23:24:58.523636367 +0800
++++ wifi-ptp/ptp/port_private.h	2023-06-29 20:22:18.000000000 +0800
+@@ -142,10 +142,26 @@
+ 	/* unicast service mode */
+ 	struct unicast_service *unicast_service;
+ 	int inhibit_multicast_service;
++    struct address slave_address;
++    int phyno;
++    int fixed_delay;
++
++    struct ptp_message *sync_burst[S_BURST_SIZE];
++    int                 sb_idx;
++    struct ptp_message *delayreq_burst[D_BURST_SIZE];
++    int                 drq_idx;
++    int                 delay_updated;
++    int                 sync_updated;
++    TAILQ_HEAD(sync_lst, ptp_message) sync_lst;
++    struct ptp_message *last_fup;
+ };
+ 
+ #define portnum(p) (p->portIdentity.portNumber)
+ 
++int port_burst_insert(struct port *p, struct ptp_message *burst[], int burst_size, struct ptp_message *msg);
++int port_burst_interpolate(struct port *p, struct ptp_message *burst[], int burst_size, int64_t ns, int endian);
++void port_pick_syncfup(struct port *p, struct ptp_message **sync, struct ptp_message **fup);
++
+ void e2e_dispatch(struct port *p, enum fsm_event event, int mdiff);
+ enum fsm_event e2e_event(struct port *p, int fd_index);
+ 
+diff '--color=auto' -ur -x .git linuxptp/sk.c wifi-ptp/ptp/sk.c
+--- linuxptp/sk.c	2024-06-24 23:24:58.523636367 +0800
++++ wifi-ptp/ptp/sk.c	2023-06-29 20:22:18.000000000 +0800
+@@ -96,7 +96,7 @@
+ 			err = ioctl(fd, SIOCSHWTSTAMP, &ifreq);
+ 			if (err < 0) {
+ 				pr_err("ioctl SIOCSHWTSTAMP failed: %m");
+-				return err;
++			//	return err;
+ 			}
+ 		}
+ 		break;
+@@ -178,6 +178,7 @@
+ 		close(fd);
+ 		goto failed;
+ 	}
++    pr_warning("ethtool");
+ 
+ 	close(fd);
+ 
+@@ -331,6 +332,7 @@
+ 	struct iovec iov = { buf, buflen };
+ 	struct msghdr msg;
+ 	struct timespec *sw, *ts = NULL;
++    uint64_t ns;
+ 
+ 	memset(control, 0, sizeof(control));
+ 	memset(&msg, 0, sizeof(msg));
+@@ -399,6 +401,9 @@
+ 	case TS_ONESTEP:
+ 	case TS_P2P1STEP:
+ 		hwts->ts = timespec_to_tmv(ts[2]);
++        ns = hwts->ts.ns;
++//        ns = (ns >> 32) + (ns & 0xFFFFFFFFU);
++        hwts->ts.ns = (int64_t)ns * 1000;
+ 		break;
+ 	case TS_LEGACY_HW:
+ 		hwts->ts = timespec_to_tmv(ts[1]);
+@@ -459,7 +464,8 @@
+ 	case TS_P2P1STEP:
+ 		flags = SOF_TIMESTAMPING_TX_HARDWARE |
+ 			SOF_TIMESTAMPING_RX_HARDWARE |
+-			SOF_TIMESTAMPING_RAW_HARDWARE;
++			SOF_TIMESTAMPING_RAW_HARDWARE |
++            SOF_TIMESTAMPING_OPT_ID;
+ 		break;
+ 	case TS_LEGACY_HW:
+ 		flags = SOF_TIMESTAMPING_TX_HARDWARE |
+diff '--color=auto' -ur -x .git linuxptp/transport.c wifi-ptp/ptp/transport.c
+--- linuxptp/transport.c	2024-06-24 22:36:03.873836365 +0800
++++ wifi-ptp/ptp/transport.c	2023-06-29 20:22:18.000000000 +0800
+@@ -18,6 +18,13 @@
+  */
+ 
+ #include <arpa/inet.h>
++#include <sys/types.h>
++#include <unistd.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include "transport.h"
+ #include "transport_private.h"
+@@ -47,6 +54,13 @@
+ {
+ 	int len = ntohs(msg->header.messageLength);
+ 
++    if ((msg->header.control == CTL_SYNC
++            && (ntohs(msg->header.sequenceId) + 1) % S_BURST_SIZE != 0)
++        || (msg->header.control == CTL_DELAY_REQ
++            && (ntohs(msg->header.sequenceId) + 1) % D_BURST_SIZE != 0)) {
++        event |= 0x40000000;
++    }
++
+ 	return t->send(t, fda, event, 0, msg, len, NULL, &msg->hwts);
+ }
+ 
+@@ -63,6 +77,13 @@
+ {
+ 	int len = ntohs(msg->header.messageLength);
+ 
++    if ((msg->header.control == CTL_SYNC
++            && (ntohs(msg->header.sequenceId) + 1) % S_BURST_SIZE != 0)
++        || (msg->header.control == CTL_DELAY_REQ
++            && (ntohs(msg->header.sequenceId) + 1) % D_BURST_SIZE != 0)) {
++        event |= 0x40000000;
++    }
++
+ 	return t->send(t, fda, event, 0, msg, len, &msg->address, &msg->hwts);
+ }
+ 
+@@ -131,3 +152,26 @@
+ {
+ 	t->release(t);
+ }
++
++int extract_phyno(const char *iface) {
++    char syspath[256];
++    char buf[256];
++    int fd;
++    int len;
++    int phyno;
++
++    snprintf(syspath, sizeof syspath, "/sys/class/net/%s/phy80211/index", iface);
++    fd = open(syspath, O_RDONLY);
++    if (fd < 0) {
++        abort();
++    }
++    len = read(fd, buf, sizeof buf);
++    if (len < 0) {
++        abort();
++    }
++    buf[len] = 0;
++    phyno = strtol(buf, NULL, 0);
++    close(fd);
++
++    return phyno;
++}
+diff '--color=auto' -ur -x .git linuxptp/transport.h wifi-ptp/ptp/transport.h
+--- linuxptp/transport.h	2024-06-24 23:24:58.533636367 +0800
++++ wifi-ptp/ptp/transport.h	2023-06-29 20:22:18.000000000 +0800
+@@ -153,4 +153,6 @@
+  */
+ void transport_destroy(struct transport *t);
+ 
++int extract_phyno(const char *iface);
++
+ #endif
+diff '--color=auto' -ur -x .git linuxptp/tsproc.c wifi-ptp/ptp/tsproc.c
+--- linuxptp/tsproc.c	2024-06-24 22:36:03.873836365 +0800
++++ wifi-ptp/ptp/tsproc.c	2023-06-29 20:22:18.000000000 +0800
+@@ -152,6 +152,12 @@
+ 	if (tmv_is_zero(tsp->t2) || tmv_is_zero(tsp->t3))
+ 		return -1;
+ 
++    pr_debug("tsproc_update_delay: t1=%ld, t2=%ld, t3=%ld, t4=%ld",
++                tmv_to_nanoseconds(tsp->t1),
++                tmv_to_nanoseconds(tsp->t2),
++                tmv_to_nanoseconds(tsp->t3),
++                tmv_to_nanoseconds(tsp->t4));
++
+ 	raw_delay = get_raw_delay(tsp);
+ 	tsp->filtered_delay = filter_sample(tsp->delay_filter, raw_delay);
+ 	tsp->filtered_delay_valid = 1;
+diff '--color=auto' -ur -x .git linuxptp/udp.c wifi-ptp/ptp/udp.c
+--- linuxptp/udp.c	2024-06-24 23:24:58.533636367 +0800
++++ wifi-ptp/ptp/udp.c	2023-06-29 20:22:18.000000000 +0800
+@@ -118,10 +118,12 @@
+ 		pr_err("bind failed: %m");
+ 		goto no_option;
+ 	}
++
+ 	if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, name, strlen(name))) {
+ 		pr_err("setsockopt SO_BINDTODEVICE failed: %m");
+ 		goto no_option;
+ 	}
++
+ 	if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl))) {
+ 		pr_err("setsockopt IP_MULTICAST_TTL failed: %m");
+ 		goto no_option;
+@@ -221,6 +223,12 @@
+ 	unsigned char junk[1600];
+ 	ssize_t cnt;
+ 	int fd = -1;
++    int tos = 0;
++
++    if (event & 0x40000000) {
++        event &= ~0x40000000;
++        tos = 1;
++    }
+ 
+ 	switch (event) {
+ 	case TRANS_GENERAL:
+@@ -253,11 +261,21 @@
+ 	if (event == TRANS_ONESTEP)
+ 		len += 2;
+ 
++    if (tos) {
++        int optval = 129;
++        setsockopt(fd, IPPROTO_IP, IP_TOS, &optval, sizeof optval);
++    }
++
+ 	cnt = sendto(fd, buf, len, 0, &addr->sa, sizeof(addr->sin));
+ 	if (cnt < 1) {
+ 		pr_err("sendto failed: %m");
+ 		return cnt;
+ 	}
++
++    if (tos) {
++        int optval = 0;
++        setsockopt(fd, IPPROTO_IP, IP_TOS, &optval, sizeof optval);
++    }
+ 	/*
+ 	 * Get the time stamp right away.
+ 	 */

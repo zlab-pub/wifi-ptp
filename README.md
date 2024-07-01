@@ -17,57 +17,66 @@ The `ath9k` directory contains the modified ath9k driver based on Linux Kernel 4
 
 1. Patch `drivers/net/wireless/ath` in the Kernel source tree with this repo's `ath9k.diff`. We recommend `patch` to do this.
 
+   ```bash
+   cd <kernel_source>/drivers/net/wireless/ath
+   patch -sf -p1 < <repo_path>/wifi-ptp/ath9k.diff
+   ```
+
 2. Build ath9k driver.
 
-```bash
+    ```bash
     cd <kernel source>
-
     make M=drivers/net/wireless/ath
-```
+    ```
 
 3. Replace the ath9k driver.
 
-```bash
-WLAN_DEV=wlan0
+    ```bash
+    WLAN_DEV=wlan0
 
-ifdown ${WLAN_DEV}
+    ifdown ${WLAN_DEV}
 
-rmmod ath9k
-rmmod ath9k_common
-rmmod ath9k_hw
-rmmod ath
+    rmmod ath9k
+    rmmod ath9k_common
+    rmmod ath9k_hw
+    rmmod ath
 
-cd <kernel source>/drivers/net/wireless/ath
-insmod ./ath.ko
-insmod ./ath9k/ath9k_hw.ko
-insmod ./ath9k/ath9k_common.ko
-insmod ./ath9k/ath9k.ko
+    cd <kernel source>/drivers/net/wireless/ath
+    insmod ./ath.ko
+    insmod ./ath9k/ath9k_hw.ko
+    insmod ./ath9k/ath9k_common.ko
+    insmod ./ath9k/ath9k.ko
 
-sleep 1
+    sleep 1
 
-ifup ${WLAN_DEV}
-```
+    ifup ${WLAN_DEV}
+    ```
 
-Note: please replace the `wlan0` above with the actual ath9k interface.
+    Note: please replace the `wlan0` above with the actual ath9k interface.
 
 4. Check for the PTP device.
 
-```bash
+    ```bash
     ls /sys/class/net/${WLAN_DEV}/device/ptp
-```
+    ```
 
-The above command should output a `ptp<X>`.
+    The above command should output a `ptp<X>`.
 
-### Build linuxptp 
-The ptp version in this repo is modified to disable PTP capability checking.
+### Build linuxptp
+
+The ptp version in this repo is modified to disable PTP capability checking. Our modified version based on the commit [dd30b3a](https://github.com/richardcochran/linuxptp/tree/dd30b3a0d94d1c087066066e5df6bc84e3019b0b). We also provide a file `linuxptp.patch`, which is the diff information between the commit `dd30b3a` and our modified linuxptp.
 
 ```bash
-    cd <repo path>/ptp
-
-    make
+cd <repo path>/ptp
+make
 ```
 
 After building the `linuxptp`, the ar9300+ wireless cards can be used to perform PTP as ethernet cards.
+
+### Running with `ptp4l`
+
+Master: `./ptp4l -i wlan0 -p /dev/ptp<X> -m`
+Slave:  `./ptp4l -i wlan0 -p /dev/ptp<X> -m -s`
 
 ## Citation
 
@@ -88,4 +97,3 @@ month = jul,
 ## Contact
 
 If you have any questions, please don't hesitate to contact [yangzhc@shanghaitech.edu.cn](mailto:yangzhc@shanghaitech.edu.cn) or [chenpzh@shanghaitech.edu.cn](mailto:chenpzh@shanghaitech.edu.cn).
-
